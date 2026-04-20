@@ -4,10 +4,13 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# ── [수정 1] RAG 모듈 임포트 (신규 추가) ──────────────────────────────────────
+# ── RAG 모듈 임포트 ───────────────────────────────────────────────────────────
 from rag.loader import get_personality_keywords
 from rag.retriever import build_vectorstore, retrieve_places, format_place_context
 from rag.validator import validate_itinerary
+
+# ── 인증 모듈 임포트 ──────────────────────────────────────────────────────────
+from auth import get_auth_headers, logout, require_auth, show_login_ui
 
 # ── 페이지 설정 ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -46,7 +49,11 @@ defaults = {
     "start_date": None,
     "end_date": None,
     "itinerary": "",
-    "retrieved_places": [],  # [수정 2] RAG 검색 결과 저장 (신규 추가)
+    "retrieved_places": [],
+    # ── 인증 상태 ────────────────────────────────────────────────────────────
+    "is_logged_in": False,
+    "access_token": "",
+    "username": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -61,7 +68,7 @@ def get_llm(streaming: bool = False) -> ChatOpenAI:
         st.stop()
     return ChatOpenAI(
         model="gpt-4o",
-        temperature=0.7,
+        temperature=0.8,  # [4단계] 다양성 증가 (0.7 → 0.8)
         streaming=streaming,
         openai_api_key=api_key,
     )
@@ -134,7 +141,15 @@ ITINERARY_SYSTEM_RAG = (
     ITINERARY_SYSTEM
     + "\n\n[중요] 아래 제공된 장소 목록에서만 선택하여 일정을 구성하라.\n"
     "목록에 없는 장소는 절대 사용 금지.\n"
-    "하루에 장소는 3~4개 배치하라."
+    "하루에 장소는 3~4개 배치하라.\n\n"
+    "[문장 스타일 규칙]\n"
+    "- '~에서 시간을 보냅니다', '~을 즐길 수 있습니다' 같은 반복 표현 절대 금지\n"
+    "- 각 장소 설명은 서로 다른 문장 구조와 어휘를 사용하라\n"
+    "- 실제 여행 가이드처럼 감정·분위기·오감을 담아 서술하라\n"
+    "- 오전/오후/저녁의 흐름이 자연스럽게 이어지도록 연결하라\n"
+    "- 다양한 표현 예시: '탁 트인 뷰가 인상적인', '골목 사이로 스며드는', "
+    "'현지인들이 즐겨 찾는', '오래된 향수가 느껴지는', '잠시 걸음을 멈추게 하는'\n"
+    "- 설명은 1~2문장, 간결하되 생생하게"
 )
 
 itinerary_prompt = ChatPromptTemplate.from_messages([
@@ -185,9 +200,21 @@ def generate_itinerary(
     return full_text
 
 
-# ── 헤더 ──────────────────────────────────────────────────────────────────────
+# ── 인증 게이트 ───────────────────────────────────────────────────────────────
+if not require_auth():
+    show_login_ui()
+    st.stop()
+
+# ── 헤더 (로그인 완료 후에만 렌더링) ─────────────────────────────────────────
 st.title("AI 여행 플래너")
 st.caption("여행 성향을 분석하고 맞춤형 여행 일정을 생성합니다.")
+
+# 로그아웃 버튼 (우상단)
+with st.sidebar:
+    st.write(f"**{st.session_state.get('username', '')}** 님")
+    if st.button("로그아웃", use_container_width=True):
+        logout()
+        st.rerun()
 
 # 진행 단계 표시
 step_labels = ["성향 질문", "성향 분석", "여행 정보", "일정 생성"]
@@ -316,6 +343,7 @@ elif st.session_state.stage == 4:
             query,
             st.session_state.region,
             top_k=15,
+            personality=st.session_state.personality,
         )
         st.session_state.retrieved_places = retrieved
 
