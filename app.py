@@ -4,6 +4,11 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+# ── [수정 1] RAG 모듈 임포트 (신규 추가) ──────────────────────────────────────
+from rag.loader import get_personality_keywords
+from rag.retriever import build_vectorstore, retrieve_places, format_place_context
+from rag.validator import validate_itinerary
+
 # ── 페이지 설정 ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI 여행 플래너",
@@ -34,13 +39,14 @@ PERSONALITY_DESC = {
 
 # ── 세션 상태 초기화 ───────────────────────────────────────────────────────────
 defaults = {
-    "stage": 1,          # 1: 질문 | 2: 성향분석 | 3: 여행정보 | 4: 일정생성
+    "stage": 1,              # 1: 질문 | 2: 성향분석 | 3: 여행정보 | 4: 일정생성
     "answers": {},
     "personality": None,
     "region": "",
     "start_date": None,
     "end_date": None,
     "itinerary": "",
+    "retrieved_places": [],  # [수정 2] RAG 검색 결과 저장 (신규 추가)
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -123,17 +129,57 @@ ITINERARY_SYSTEM = (
     "- 추천 장소가 없을 경우 '추천 결과 없음'만 출력"
 )
 
+# [수정 3-a] RAG 컨텍스트 주입용 시스템 프롬프트 (신규 추가)
+ITINERARY_SYSTEM_RAG = (
+    ITINERARY_SYSTEM
+    + "\n\n[중요] 아래 제공된 장소 목록에서만 선택하여 일정을 구성하라.\n"
+    "목록에 없는 장소는 절대 사용 금지.\n"
+    "하루에 장소는 3~4개 배치하라."
+)
+
 itinerary_prompt = ChatPromptTemplate.from_messages([
     ("system", ITINERARY_SYSTEM),
     ("human", "여행 성향: {personality}\n여행 지역: {region}\n여행 일수: {days}일"),
 ])
 
+# [수정 3-b] RAG 전용 프롬프트 템플릿 (신규 추가)
+itinerary_prompt_rag = ChatPromptTemplate.from_messages([
+    ("system", ITINERARY_SYSTEM_RAG),
+    ("human", (
+        "여행 성향: {personality}\n"
+        "여행 지역: {region}\n"
+        "여행 일수: {days}일\n\n"
+        "[참고 장소 목록]\n{place_context}"
+    )),
+])
 
-def generate_itinerary(personality: str, region: str, days: int) -> str:
-    chain = itinerary_prompt | get_llm(streaming=True) | StrOutputParser()
+
+# [수정 3-c] generate_itinerary에 retrieved_places 파라미터 추가
+# 기존 시그니처 유지 (retrieved_places=None → 기존 동작 그대로)
+def generate_itinerary(
+    personality: str,
+    region: str,
+    days: int,
+    retrieved_places: list[dict] | None = None,
+) -> str:
+    if retrieved_places:
+        # RAG 경로: 검색된 장소를 컨텍스트로 주입
+        prompt = itinerary_prompt_rag
+        inputs = {
+            "personality":   personality,
+            "region":        region,
+            "days":          days,
+            "place_context": format_place_context(retrieved_places),
+        }
+    else:
+        # Fallback 경로: 기존 LLM-only 동작 유지
+        prompt = itinerary_prompt
+        inputs = {"personality": personality, "region": region, "days": days}
+
+    chain = prompt | get_llm(streaming=True) | StrOutputParser()
     placeholder = st.empty()
     full_text = ""
-    for chunk in chain.stream({"personality": personality, "region": region, "days": days}):
+    for chunk in chain.stream(inputs):
         full_text += chunk
         placeholder.code(full_text, language=None)
     return full_text
@@ -243,6 +289,7 @@ elif st.session_state.stage == 3:
             st.rerun()
 
 # ── 4단계: 여행 일정 생성 ─────────────────────────────────────────────────────
+# [수정 4] RAG 검색 → 일정 생성 → 검증 결과 표시 로직 통합
 elif st.session_state.stage == 4:
     days = (st.session_state.end_date - st.session_state.start_date).days + 1
 
@@ -255,22 +302,76 @@ elif st.session_state.stage == 4:
     st.divider()
 
     if not st.session_state.itinerary:
+        # ── [추가] RAG: 벡터 스토어 빌드 + 장소 검색 ────────────────────────
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
+        vectorstore = build_vectorstore(api_key)
+
+        query = (
+            f"{st.session_state.personality} "
+            f"{get_personality_keywords(st.session_state.personality)} "
+            f"{st.session_state.region}"
+        )
+        retrieved = retrieve_places(
+            vectorstore,
+            query,
+            st.session_state.region,
+            top_k=15,
+        )
+        st.session_state.retrieved_places = retrieved
+
+        # RAG 검색 결과 요약 표시
+        if retrieved:
+            with st.expander(f"RAG 검색된 후보 장소 {len(retrieved)}개 보기"):
+                for p in retrieved:
+                    st.markdown(f"- **{p['장소명']}** ({p['카테고리']}) — {p['주소']}")
+
+        # ── 일정 생성 (RAG 컨텍스트 주입) ───────────────────────────────────
         st.session_state.itinerary = generate_itinerary(
             st.session_state.personality,
             st.session_state.region,
             days,
+            retrieved_places=retrieved if retrieved else None,
         )
+
+        # ── [추가] 검증 로직 ─────────────────────────────────────────────────
+        if retrieved:
+            result = validate_itinerary(
+                st.session_state.itinerary,
+                st.session_state.retrieved_places,
+            )
+            st.session_state["validation"] = result
     else:
         st.code(st.session_state.itinerary, language=None)
+
+    # ── 검증 결과 표시 ───────────────────────────────────────────────────────
+    if st.session_state.get("validation"):
+        v = st.session_state["validation"]
+        st.divider()
+        st.caption("Hallucination 검증 결과")
+        vcol1, vcol2, vcol3 = st.columns(3)
+        vcol1.metric("전체 장소", v["total"])
+        vcol2.metric("검증 완료", len(v["verified"]))
+        vcol3.metric("미검증 장소", len(v["unverified"]))
+
+        if v["is_clean"]:
+            st.success("모든 장소가 RAG 검색 결과 내에서 확인되었습니다.")
+        else:
+            st.warning(
+                "다음 장소는 RAG 데이터에서 확인되지 않았습니다: "
+                + ", ".join(v["unverified"])
+            )
 
     st.divider()
     col_a, col_b = st.columns(2)
     with col_a:
         if st.button("일정 다시 생성", use_container_width=True):
             st.session_state.itinerary = ""
+            st.session_state.retrieved_places = []
+            st.session_state.pop("validation", None)
             st.rerun()
     with col_b:
         if st.button("처음부터 다시", use_container_width=True):
             for k, v in defaults.items():
                 st.session_state[k] = v
+            st.session_state.pop("validation", None)
             st.rerun()
