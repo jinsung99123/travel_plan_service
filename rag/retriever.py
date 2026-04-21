@@ -190,6 +190,62 @@ def _apply_metadata_score(meta: dict, score: float, personality: str) -> float:
     return score
 
 
+# ── 확장 메타데이터 점수 조정 ────────────────────────────────────────────────
+_WEATHER_PREFER_INDOOR = {"비", "더위", "추위"}
+
+
+def _apply_extended_score(
+    meta: dict,
+    score: float,
+    weather: str = "",
+    budget: str = "",
+    crowd: str = "",
+    style: str = "",
+) -> float:
+    """
+    places_extended.csv 6개 필드 기반 추가 점수 조정 (soft scoring).
+    모든 조정은 곱셈 배수로 적용하여 기존 점수 체계와 독립적으로 결합.
+    """
+    if weather in _WEATHER_PREFER_INDOOR:
+        io = meta.get("indoor_outdoor", "")
+        if io == "실내":
+            score *= 1.15
+        elif io == "실외":
+            score *= 0.80
+
+    if budget and budget != "상관없음":
+        if meta.get("price_level") == budget:
+            score *= 1.10
+        else:
+            score *= 0.90
+
+    cl = meta.get("crowd_level", "")
+    if crowd == "조용":
+        if cl == "낮음":
+            score *= 1.10
+        elif cl == "높음":
+            score *= 0.85
+    elif crowd == "활기":
+        if cl == "높음":
+            score *= 1.10
+        elif cl == "낮음":
+            score *= 0.90
+
+    stay = meta.get("stay_time", "")
+    if style == "빠르게":
+        if stay == "30~60":
+            score *= 1.10
+        elif stay == "120~180":
+            score *= 0.85
+    elif style == "여유롭게":
+        if stay == "120~180":
+            score *= 1.10
+        elif stay == "30~60":
+            score *= 0.90
+
+    return score
+
+
 # ── 지역 필터 ────────────────────────────────────────────────────────────────
 def _region_match(metadata: dict, region: str) -> bool:
     """sigungu 정확 일치 → region 포함 → 주소 포함 순으로 시도 (하위 호환 포함)."""
@@ -228,6 +284,22 @@ def _group_by_dong(places: list[dict]) -> list[dict]:
     return result
 
 
+# ── 카테고리 다양성 필터 ─────────────────────────────────────────────────────
+def _cap_by_category(places: list[dict], max_per_category: int = 3) -> list[dict]:
+    """
+    동일 카테고리 과다 방지: 카테고리당 최대 max_per_category개까지만 유지.
+    점수 내림차순 정렬 상태를 전제하므로 앞에서부터 순서대로 수집한다.
+    """
+    counts: dict[str, int] = {}
+    result: list[dict] = []
+    for meta in places:
+        cat = meta.get("카테고리", "")
+        if counts.get(cat, 0) < max_per_category:
+            result.append(meta)
+            counts[cat] = counts.get(cat, 0) + 1
+    return result
+
+
 # ── 메인 검색 함수 ────────────────────────────────────────────────────────────
 def retrieve_places(
     vectorstore: FAISS,
@@ -235,23 +307,39 @@ def retrieve_places(
     region: str,
     top_k: int = 15,
     personality: str = "",
-) -> list[dict]:
+    weather: str = "",
+    budget: str = "",
+    crowd: str = "",
+    style: str = "",
+) -> dict:
     """
-    Contextual Hybrid Retrieval — 기존 시그니처 유지, 내부 검색 로직 전면 개선.
+    Contextual Hybrid Retrieval — 검색 풀 확장 + 카테고리 다양성 + 대안 후보 반환.
 
     처리 흐름:
-      1. hybrid_search()  — FAISS(contextual embedding) + BM25 결합 → top_k*3 후보
-      2. _apply_metadata_score() — personality_tags·category penalty → 재정렬
-      3. _region_match()  — sigungu 기준 지역 필터 (fallback: 지역 무시)
-      4. random.sample()  — 상위 풀에서 다양성 확보
-      5. _group_by_dong() — 동선 최적화
-    """
-    # 1. Hybrid 후보 검색
-    candidates = hybrid_search(vectorstore, query, top_k * 3)
+      1. hybrid_search()          — FAISS + BM25 결합 → top_k*6 후보 (풀 확장)
+      2. _apply_metadata_score()  — personality_tags·category penalty
+         _apply_extended_score()  — weather·budget·crowd·style bonus/penalty
+      3. _region_match()          — 지역 필터 (fallback: 지역 무시)
+      4. _cap_by_category()       — 카테고리당 최대 3개 제한
+      5. main_places              — 상위 top_k*2 중 샘플링 → 동선 최적화
+      6. candidate_pool           — 카테고리 cap 이후 전체 (대안 추천용)
 
-    # 2. 메타데이터 penalty 적용 후 재정렬
+    반환:
+      {
+        "main_places":    list[dict],  # 기본 일정 생성용 상위 추천
+        "candidate_pool": list[dict],  # 대안 추천·재생성용 전체 후보
+      }
+    """
+    # 1. Hybrid 후보 검색 (풀 확장: top_k*3 → top_k*6)
+    candidates = hybrid_search(vectorstore, query, top_k * 6)
+
+    # 2. 기존 scoring 로직 유지 (변경 없음)
     candidates = [
-        (meta, _apply_metadata_score(meta, score, personality))
+        (meta, _apply_extended_score(
+            meta,
+            _apply_metadata_score(meta, score, personality),
+            weather=weather, budget=budget, crowd=crowd, style=style,
+        ))
         for meta, score in candidates
     ]
     candidates.sort(key=lambda x: x[1], reverse=True)
@@ -259,15 +347,23 @@ def retrieve_places(
     # 3. 지역 필터
     filtered = [meta for meta, _ in candidates if _region_match(meta, region)]
     if not filtered:
-        # fallback: 지역 무시하고 상위 결과 반환
-        filtered = [meta for meta, _ in candidates[:top_k]]
+        filtered = [meta for meta, _ in candidates[:top_k * 2]]
 
-    # 4. 랜덤 샘플링 (다양성)
-    pool_size = min(len(filtered), top_k + 5)
-    selected = random.sample(filtered[:pool_size], min(top_k, pool_size))
+    # 4. 카테고리 다양성 적용 (동일 카테고리 최대 3개)
+    diversified = _cap_by_category(filtered, max_per_category=3)
 
-    # 5. 동선 최적화
-    return _group_by_dong(selected)
+    # 5. main_places: 상위 풀에서 샘플링 후 동선 최적화
+    pool_size = min(len(diversified), top_k * 2 + 5)
+    sampled = random.sample(diversified[:pool_size], min(top_k * 2, pool_size))
+    main_places = _group_by_dong(sampled)
+
+    # 6. candidate_pool: 카테고리 cap 이후 전체 (대안 추천용, 동선 정렬 없음)
+    candidate_pool = diversified
+
+    return {
+        "main_places":    main_places,
+        "candidate_pool": candidate_pool,
+    }
 
 
 # ── 프롬프트 컨텍스트 포맷 ───────────────────────────────────────────────────
@@ -275,7 +371,12 @@ def format_place_context(places: list[dict]) -> str:
     """검색된 장소 목록을 LLM 프롬프트에 삽입할 텍스트로 변환한다."""
     lines = []
     for p in places:
-        lines.append(
-            f"- {p['장소명']} ({p['카테고리']}) | 키워드: {p['키워드']} | {p['설명']} | 주소: {p['주소']}"
-        )
+        extras = []
+        if p.get("best_time"):      extras.append(f"방문시간:{p['best_time']}")
+        if p.get("stay_time"):      extras.append(f"체류:{p['stay_time']}분")
+        if p.get("price_level"):    extras.append(f"가격:{p['price_level']}")
+        if p.get("crowd_level"):    extras.append(f"혼잡:{p['crowd_level']}")
+        if p.get("indoor_outdoor"): extras.append(f"실내외:{p['indoor_outdoor']}")
+        base = f"- {p['장소명']} ({p['카테고리']}) | 키워드: {p['키워드']} | {p['설명']} | 주소: {p['주소']}"
+        lines.append(base + (" | " + " | ".join(extras) if extras else ""))
     return "\n".join(lines)

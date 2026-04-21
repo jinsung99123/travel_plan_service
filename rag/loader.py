@@ -15,7 +15,10 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 
 @lru_cache(maxsize=1)
 def load_places() -> pd.DataFrame:
-    """places.csv 로드. 반복 I/O 방지를 위해 캐시 적용."""
+    """places_extended.csv 우선 로드, 없으면 places.csv fallback."""
+    path = DATA_DIR / "places_extended.csv"
+    if path.exists():
+        return pd.read_csv(path, encoding="utf-8")
     return pd.read_csv(DATA_DIR / "places.csv", encoding="utf-8")
 
 
@@ -139,6 +142,13 @@ def build_place_documents(
             "sigungu":          region_info["sigungu"],
             "dong":             region_info["dong"],
             "personality_tags": p_tags,
+            # ── 확장 메타데이터 (places_extended.csv) ───────────────────────
+            "stay_time":        str(row.get("stay_time", "")),
+            "crowd_level":      str(row.get("crowd_level", "")),
+            "best_time":        str(row.get("best_time", "")),
+            "price_level":      str(row.get("price_level", "")),
+            "indoor_outdoor":   str(row.get("indoor_outdoor", "")),
+            "weather_fit":      str(row.get("weather_fit", "")),
             # ── Contextual Retrieval 전용 ────────────────────────────────────
             "plain_text":       plain_text,  # BM25·디스플레이용 원본 텍스트
         }
