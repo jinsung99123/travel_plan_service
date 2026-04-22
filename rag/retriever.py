@@ -7,15 +7,24 @@
   - Contextual BM25      : rank_bm25 기반 키워드 검색 (카테고리 + keywords + 설명 토큰화)
   - Hybrid Search        : FAISS(0.6) + BM25(0.4) 정규화 점수 결합, 동일 문서 합산
   - Metadata Score       : personality_tags·category 불일치 시 점수 penalty 적용
+  - Semantic Reranking   : LLM 기반 사용자 의도 적합도 재정렬 (base*0.7 + rerank*0.3)
 """
 
+import json
+import hashlib
 import random
 import re
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import streamlit as st
 from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from rank_bm25 import BM25Okapi
+
+if TYPE_CHECKING:
+    from langchain_openai import ChatOpenAI
 
 from .indexer import get_or_build_vectorstore
 from .loader import load_places, load_persona, build_place_documents
@@ -300,6 +309,122 @@ def _cap_by_category(places: list[dict], max_per_category: int = 3) -> list[dict
     return result
 
 
+# ── Semantic Reranking ──────────────────────────────────────────────────────
+RERANK_SYSTEM = (
+    "너는 여행 추천 시스템의 정밀도를 높이는 랭킹 모델이다.\n\n"
+    "사용자의 요청과 각 장소의 적합도를 평가하여 0~1 사이의 점수를 부여하라.\n\n"
+    "평가 기준:\n"
+    "1. 사용자의 의도와 의미적 유사도 (가장 중요)\n"
+    "2. 성향(personality) 적합성\n"
+    "3. 날씨 / 예산 / 혼잡도 조건 일치 여부\n"
+    "4. 실제 방문 매력도\n\n"
+    "점수 기준:\n"
+    "- 0.9 이상: 매우 적합\n"
+    "- 0.7~0.9: 적합\n"
+    "- 0.5~0.7: 보통\n"
+    "- 0.5 미만: 부적합\n\n"
+    "반드시 JSON 배열만 반환하라. 다른 텍스트 출력 금지.\n"
+    '예시: [{"id": 0, "score": 0.92}, {"id": 1, "score": 0.75}]'
+)
+
+_rerank_prompt = ChatPromptTemplate.from_messages([
+    ("system", RERANK_SYSTEM),
+    ("human", "{user_msg}"),
+])
+
+# 모듈 레벨 캐시: {cache_key: {idx: score}}
+_RERANK_CACHE: dict[str, dict[int, float]] = {}
+
+
+def _rerank_cache_key(
+    query: str,
+    candidate_ids: tuple,
+    personality: str,
+    weather: str,
+    budget: str,
+    crowd: str,
+    style: str,
+) -> str:
+    raw = f"{query}|{candidate_ids}|{personality}|{weather}|{budget}|{crowd}|{style}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def rerank_places(
+    query: str,
+    candidates: list[dict],
+    score_map: dict,
+    llm: "ChatOpenAI",
+    personality: str = "",
+    weather: str = "",
+    budget: str = "",
+    crowd: str = "",
+    style: str = "",
+    rerank_weight: float = 0.3,
+) -> list[dict]:
+    """
+    LLM 기반 Semantic Reranking.
+
+    - candidates: random.sample() 이후의 metadata list (20~30개)
+    - score_map:  {doc_id: base_score} — scoring 단계에서 보존된 원점수
+    - 최종 점수:  base_score * 0.7 + rerank_score * 0.3
+    - LLM 실패 시 기존 순서 유지 (fallback)
+    - 동일 입력에 대한 결과는 모듈 레벨 dict로 캐싱
+    """
+    if not candidates:
+        return candidates
+
+    # ── 캐시 확인 ────────────────────────────────────────────────────────────
+    ids_tuple = tuple(c.get("id", i) for i, c in enumerate(candidates))
+    cache_key = _rerank_cache_key(query, ids_tuple, personality, weather, budget, crowd, style)
+    if cache_key in _RERANK_CACHE:
+        rerank_scores = _RERANK_CACHE[cache_key]
+    else:
+        # ── LLM 호출 ─────────────────────────────────────────────────────────
+        places_text = "\n".join(
+            f"{idx}. [id={idx}] {c.get('장소명', '')} ({c.get('카테고리', '')}) | "
+            f"키워드: {c.get('키워드', '')} | {c.get('설명', '')} | "
+            f"체류:{c.get('stay_time', '-')} | 가격:{c.get('price_level', '-')} | "
+            f"혼잡:{c.get('crowd_level', '-')} | 실내외:{c.get('indoor_outdoor', '-')}"
+            for idx, c in enumerate(candidates)
+        )
+        user_msg = (
+            f"사용자 쿼리: {query}\n"
+            f"성향: {personality or '미정'} | 날씨: {weather or '자동'} | "
+            f"예산: {budget or '상관없음'} | 혼잡: {crowd or '상관없음'} | "
+            f"스타일: {style or '보통'}\n\n"
+            f"후보 장소 목록 ({len(candidates)}개):\n{places_text}\n\n"
+            f"각 장소에 대해 적합도 점수를 JSON 배열로만 반환하라."
+        )
+        try:
+            chain = _rerank_prompt | llm | StrOutputParser()
+            raw = chain.invoke({"user_msg": user_msg}).strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"```[a-z]*\n?", "", raw).strip("` \n")
+            parsed: list[dict] = json.loads(raw)
+            rerank_scores = {int(item["id"]): float(item["score"]) for item in parsed}
+            _RERANK_CACHE[cache_key] = rerank_scores
+        except Exception as exc:
+            print(f"[rerank] LLM 응답 파싱 실패: {exc} — 기존 점수 유지")
+            return candidates
+
+    # ── 점수 결합 ─────────────────────────────────────────────────────────────
+    base_weight = 1.0 - rerank_weight
+    scored: list[tuple[dict, float]] = []
+    for idx, meta in enumerate(candidates):
+        doc_id   = meta.get("id")
+        base     = score_map.get(doc_id, 0.5)
+        rerank   = rerank_scores.get(idx, 0.5)
+        final    = base * base_weight + rerank * rerank_weight
+        print(
+            f"[rerank log] id={doc_id} 장소={meta.get('장소명', '?')!s:<18} "
+            f"base_score={base:.4f}  rerank_score={rerank:.4f}  final_score={final:.4f}"
+        )
+        scored.append((meta, final))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [m for m, _ in scored]
+
+
 # ── 메인 검색 함수 ────────────────────────────────────────────────────────────
 def retrieve_places(
     vectorstore: FAISS,
@@ -311,6 +436,7 @@ def retrieve_places(
     budget: str = "",
     crowd: str = "",
     style: str = "",
+    llm: "ChatOpenAI | None" = None,
 ) -> dict:
     """
     Contextual Hybrid Retrieval — 검색 풀 확장 + 카테고리 다양성 + 대안 후보 반환.
@@ -321,8 +447,10 @@ def retrieve_places(
          _apply_extended_score()  — weather·budget·crowd·style bonus/penalty
       3. _region_match()          — 지역 필터 (fallback: 지역 무시)
       4. _cap_by_category()       — 카테고리당 최대 3개 제한
-      5. main_places              — 상위 top_k*2 중 샘플링 → 동선 최적화
-      6. candidate_pool           — 카테고리 cap 이후 전체 (대안 추천용)
+      5. random.sample()          — 상위 풀에서 샘플링
+      ✅ rerank_places()          — LLM Semantic Reranking (llm 전달 시 활성화)
+      6. _group_by_dong()         — 동선 최적화
+      7. candidate_pool           — 카테고리 cap 이후 전체 (대안 추천용)
 
     반환:
       {
@@ -330,7 +458,7 @@ def retrieve_places(
         "candidate_pool": list[dict],  # 대안 추천·재생성용 전체 후보
       }
     """
-    # 1. Hybrid 후보 검색 (풀 확장: top_k*3 → top_k*6)
+    # 1. Hybrid 후보 검색 (풀 확장: top_k*6)
     candidates = hybrid_search(vectorstore, query, top_k * 6)
 
     # 2. 기존 scoring 로직 유지 (변경 없음)
@@ -344,6 +472,9 @@ def retrieve_places(
     ]
     candidates.sort(key=lambda x: x[1], reverse=True)
 
+    # scoring 완료 시점의 점수 보존 — reranking 결합에 사용
+    score_map: dict = {meta.get("id"): score for meta, score in candidates}
+
     # 3. 지역 필터
     filtered = [meta for meta, _ in candidates if _region_match(meta, region)]
     if not filtered:
@@ -352,12 +483,28 @@ def retrieve_places(
     # 4. 카테고리 다양성 적용 (동일 카테고리 최대 3개)
     diversified = _cap_by_category(filtered, max_per_category=3)
 
-    # 5. main_places: 상위 풀에서 샘플링 후 동선 최적화
+    # 5. 상위 풀에서 샘플링
     pool_size = min(len(diversified), top_k * 2 + 5)
     sampled = random.sample(diversified[:pool_size], min(top_k * 2, pool_size))
+
+    # ✅ Semantic Reranking — random.sample() 이후, _group_by_dong() 이전
+    if llm is not None:
+        sampled = rerank_places(
+            query=query,
+            candidates=sampled,
+            score_map=score_map,
+            llm=llm,
+            personality=personality,
+            weather=weather,
+            budget=budget,
+            crowd=crowd,
+            style=style,
+        )
+
+    # 6. 동선 최적화
     main_places = _group_by_dong(sampled)
 
-    # 6. candidate_pool: 카테고리 cap 이후 전체 (대안 추천용, 동선 정렬 없음)
+    # 7. candidate_pool: 카테고리 cap 이후 전체 (대안 추천용, 동선 정렬 없음)
     candidate_pool = diversified
 
     return {

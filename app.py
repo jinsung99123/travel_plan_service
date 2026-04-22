@@ -1,3 +1,4 @@
+import json
 import re
 import uuid
 import streamlit as st
@@ -65,6 +66,14 @@ defaults = {
     # ── 저장된 일정 ──────────────────────────────────────────────────────────
     "saved_plans": [],
     "viewing_plan_id": None,
+    # ── TL;DR 요약 ───────────────────────────────────────────────────────────
+    "tldr_summary": "",
+    # ── 추천 근거 요약 ────────────────────────────────────────────────────────
+    "reason_summary": "",
+    # ── 추천 신뢰도 ──────────────────────────────────────────────────────────
+    "confidence_result": None,
+    # ── 장소 교체 UX ─────────────────────────────────────────────────────────
+    "_replace_flash": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -226,6 +235,62 @@ itinerary_prompt = ChatPromptTemplate.from_messages([
     ("human", "여행 성향: {personality}\n여행 지역: {region}\n여행 일수: {days}일"),
 ])
 
+# ── 추천 근거 요약 프롬프트 ───────────────────────────────────────────────────
+REASON_SUMMARY_SYSTEM = (
+    "너는 여행 추천 시스템의 설명 생성기다.\n"
+    "사용자의 조건과 추천된 장소 목록을 기반으로\n"
+    "왜 이 일정이 구성되었는지 간결하게 설명하라.\n\n"
+    "규칙:\n"
+    "- 3~5줄 bullet 형태로 작성\n"
+    "- 각 줄은 '- ' 으로 시작\n"
+    "- 각 줄은 '~을 반영하여 ~ 구성했습니다' 형태\n"
+    "- 실제 제공된 장소 데이터에 근거한 사실만 작성\n"
+    "- 존재하지 않는 정보나 추측 표현 금지\n"
+    "- 중복 표현 금지, 과장 금지\n"
+    "- 한국어, 자연스럽고 간결하게\n"
+    "- bullet 외 다른 텍스트 출력 금지"
+)
+
+reason_summary_prompt = ChatPromptTemplate.from_messages([
+    ("system", REASON_SUMMARY_SYSTEM),
+    ("human", (
+        "성향: {personality}\n"
+        "지역: {region}\n"
+        "날씨: {weather}\n"
+        "예산: {budget}\n"
+        "혼잡도: {crowd}\n"
+        "일정스타일: {travel_style}\n\n"
+        "추천 장소 (상위 5개):\n{top_places}"
+    )),
+])
+
+# ── TL;DR 요약 프롬프트 ───────────────────────────────────────────────────────
+TLDR_SYSTEM = (
+    "너는 여행 일정 요약 전문가다.\n"
+    "주어진 일정 내용을 핵심만 간결하게 요약하라.\n\n"
+    "규칙:\n"
+    "- 정확히 4줄만 출력하라\n"
+    "- 줄 순서와 이모지·태그를 반드시 지켜라:\n"
+    "  줄1: 🌿 컨셉: (여행 전반의 분위기·테마 한 문장)\n"
+    "  줄2: 📍 주요 구성: (일정에 등장하는 장소 유형·카테고리 나열)\n"
+    "  줄3: ⏱️ 일정 스타일: (이동 여유·밀도 특징 한 문장)\n"
+    "  줄4: 💡 특징: (이 일정만의 차별 포인트 한 문장)\n"
+    "- 실제 일정 텍스트에 존재하는 장소·내용만 사용\n"
+    "- 없는 장소 추가·추측 표현·과장 금지\n"
+    "- 중복 표현 금지\n"
+    "- 한국어, 자연스럽고 간결하게\n"
+    "- 4줄 bullet 외 다른 텍스트 출력 금지"
+)
+
+tldr_prompt = ChatPromptTemplate.from_messages([
+    ("system", TLDR_SYSTEM),
+    ("human", (
+        "성향: {personality}\n"
+        "일정 스타일: {travel_style}\n\n"
+        "일정:\n{itinerary}"
+    )),
+])
+
 # [수정 3-b] RAG 전용 프롬프트 템플릿 (신규 추가)
 itinerary_prompt_rag = ChatPromptTemplate.from_messages([
     ("system", ITINERARY_SYSTEM_RAG),
@@ -352,7 +417,7 @@ def _parse_itinerary(itinerary: str) -> list[dict]:
     return days
 
 
-def render_timeline(itinerary: str) -> None:
+def render_timeline(itinerary: str, interactive: bool = False) -> None:
     """파싱된 일정을 시간 흐름 기반 타임라인 UI로 렌더링한다."""
     days = _parse_itinerary(itinerary)
 
@@ -360,19 +425,26 @@ def render_timeline(itinerary: str) -> None:
         st.code(itinerary, language=None)
         return
 
+    # 장소 교체 후 플래시 메시지 표시
+    if interactive:
+        flash = st.session_state.get("_replace_flash", "")
+        if flash:
+            st.session_state["_replace_flash"] = ""
+            st.success(flash)
+
     for day_data in days:
         st.markdown(
             f"<h3 style='margin:24px 0 8px 0; color:#3a3f5c;'>📆 Day {day_data['day']}</h3>",
             unsafe_allow_html=True,
         )
 
-        for place in day_data["places"]:
-            emoji  = _time_emoji(place["start_time"])
-            label  = _time_label(place["start_time"])
-            tr     = place["time_range"]
-            name   = place["name"]
-            desc   = place["description"]
-            alts   = place["alternatives"]
+        for place_idx, place in enumerate(day_data["places"]):
+            emoji   = _time_emoji(place["start_time"])
+            label   = _time_label(place["start_time"])
+            tr      = place["time_range"]
+            name    = place["name"]
+            desc    = place["description"]
+            alts    = place["alternatives"]
             reasons = place["reasons"]
 
             reason_html = ""
@@ -392,8 +464,7 @@ def render_timeline(itinerary: str) -> None:
                     f"🔀 대안: {alts}</p>"
                 )
 
-            st.markdown(
-                f"""
+            card_html = f"""
                 <div style="
                     display:flex; gap:14px; align-items:flex-start;
                     background:#ffffff; border:1px solid #e0e6f0;
@@ -413,28 +484,72 @@ def render_timeline(itinerary: str) -> None:
                     {alt_html}
                   </div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                """
+
+            if interactive:
+                col_card, col_btn = st.columns([9, 1])
+                with col_card:
+                    st.markdown(card_html, unsafe_allow_html=True)
+                with col_btn:
+                    st.write("")
+                    btn_key = f"replace_{day_data['day']}_{place_idx}"
+                    if st.button("🔄", key=btn_key, help=f"'{name}' 을(를) 다른 장소로 교체"):
+                        replaced = _replace_place(name)
+                        if not replaced:
+                            st.session_state["_replace_flash"] = (
+                                f"⚠️ '{name}' 을(를) 대체할 후보 장소가 없습니다."
+                            )
+                        st.rerun()
+            else:
+                st.markdown(card_html, unsafe_allow_html=True)
 
         st.divider()
 
 
-def save_plan(days: int) -> None:
+def save_plan(days: int, title: str = "") -> None:
     """현재 session_state의 일정을 saved_plans에 저장한다."""
+    personality = st.session_state.get("personality", "미정")
+    region      = st.session_state.get("region", "미입력")
     plan = {
         "id":           str(uuid.uuid4()),
-        "personality":  st.session_state.get("personality", "미정"),
-        "region":       st.session_state.get("region", "미입력"),
+        "title":        title or f"{personality} · {region} {days}일",
+        "personality":  personality,
+        "region":       region,
         "days":         days,
         "weather":      st.session_state.get("weather", "자동"),
         "budget":       st.session_state.get("budget", "상관없음"),
         "travel_style": float(st.session_state.get("travel_style", 0.5)),
         "crowd":        st.session_state.get("crowd", "상관없음"),
         "itinerary":    st.session_state.get("itinerary", ""),
+        "tldr_summary": st.session_state.get("tldr_summary", ""),
         "created_at":   datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
     st.session_state["saved_plans"].insert(0, plan)  # 최신순
+
+
+def load_plan(plan_id: str) -> None:
+    """저장된 일정을 현재 활성 일정으로 불러온다."""
+    plan = next(
+        (p for p in st.session_state["saved_plans"] if p["id"] == plan_id),
+        None,
+    )
+    if not plan:
+        return
+    st.session_state.itinerary      = plan["itinerary"]
+    st.session_state.personality    = plan["personality"]
+    st.session_state.region         = plan["region"]
+    st.session_state.weather        = plan.get("weather", "자동")
+    st.session_state.budget         = plan.get("budget", "상관없음")
+    st.session_state.travel_style   = plan.get("travel_style", 0.5)
+    st.session_state.crowd          = plan.get("crowd", "상관없음")
+    st.session_state["tldr_summary"]       = plan.get("tldr_summary", "")
+    st.session_state["reason_summary"]     = ""
+    st.session_state["confidence_result"]  = None
+    st.session_state.retrieved_places      = []
+    st.session_state.candidate_pool        = []
+    st.session_state.pop("validation", None)
+    st.session_state.stage               = 4
+    st.session_state["viewing_plan_id"]  = None
 
 
 def render_saved_plans() -> None:
@@ -455,17 +570,33 @@ def render_saved_plans() -> None:
         st.sidebar.caption("저장된 일정이 없습니다.")
         return
 
+    # 전체 JSON 내보내기
+    st.sidebar.download_button(
+        label="📥 전체 내보내기 (JSON)",
+        data=json.dumps(plans, ensure_ascii=False, indent=2),
+        file_name="travel_plans_all.json",
+        mime="application/json",
+        use_container_width=True,
+        key="export_all_plans",
+    )
+
     for plan in plans:
         with st.sidebar.container():
+            # 제목 (타이틀 우선, 없으면 구 형식 폴백)
+            title = plan.get("title") or f"{plan['personality']} · {plan['region']} {plan['days']}일"
             st.sidebar.markdown(
-                f"**{plan['personality']}** · {plan['region']} · {plan['days']}일  \n"
+                f"**{title}**  \n"
                 f"<span style='font-size:11px;color:#888;'>{plan['created_at']}</span>",
                 unsafe_allow_html=True,
             )
-            btn_col, del_col = st.sidebar.columns([3, 1])
-            with btn_col:
+            view_col, load_col, del_col = st.sidebar.columns([2, 2, 1])
+            with view_col:
                 if st.button("보기", key=f"view_{plan['id']}"):
                     st.session_state["viewing_plan_id"] = plan["id"]
+                    st.rerun()
+            with load_col:
+                if st.button("불러오기", key=f"load_{plan['id']}"):
+                    load_plan(plan["id"])
                     st.rerun()
             with del_col:
                 if st.button("삭제", key=f"del_{plan['id']}"):
@@ -486,6 +617,238 @@ def _style_label(travel_style: float) -> str:
     if travel_style > 0.6:
         return "여유롭게"
     return "보통"
+
+
+def generate_reason_summary(
+    personality: str,
+    region: str,
+    weather: str,
+    budget: str,
+    crowd: str,
+    travel_style: float,
+    retrieved_places: list[dict],
+) -> str:
+    """
+    검색된 장소와 사용자 조건을 바탕으로 추천 근거를 LLM으로 생성한다.
+    streaming=False: 짧은 출력이므로 단순 invoke 사용.
+    """
+    top5 = retrieved_places[:5]
+    top_places_text = "\n".join(
+        f"- {p['장소명']} ({p['카테고리']}) | 혼잡:{p.get('crowd_level', '-')} "
+        f"| 실내외:{p.get('indoor_outdoor', '-')} | 가격:{p.get('price_level', '-')}"
+        for p in top5
+    )
+    style_label = _style_label(travel_style)
+
+    chain = reason_summary_prompt | get_llm(streaming=False) | StrOutputParser()
+    return chain.invoke({
+        "personality":  personality,
+        "region":       region,
+        "weather":      weather,
+        "budget":       budget,
+        "crowd":        crowd,
+        "travel_style": style_label,
+        "top_places":   top_places_text,
+    }).strip()
+
+
+def generate_tldr_summary(
+    itinerary: str,
+    personality: str,
+    travel_style: float,
+) -> str:
+    """일정 텍스트를 기반으로 4줄 TL;DR 요약을 LLM으로 생성한다."""
+    style_label = _style_label(travel_style)
+    chain = tldr_prompt | get_llm(streaming=False) | StrOutputParser()
+    return chain.invoke({
+        "personality":   personality,
+        "travel_style":  style_label,
+        "itinerary":     itinerary,
+    }).strip()
+
+
+def calculate_confidence(
+    itinerary: str,
+    retrieved_places: list[dict],
+    personality: str,
+    region: str,
+    validation: dict | None = None,
+) -> dict:
+    """
+    4가지 기준으로 추천 신뢰도를 계산한다.
+
+    반환:
+      score       : 0.0~1.0 가중 합산 점수
+      level       : "높음" / "보통" / "낮음"
+      level_emoji : 🟢 / 🟡 / 🔴
+      details     : 각 세부 점수 및 표시용 텍스트
+    """
+    from rag.validator import extract_place_names
+
+    extracted = extract_place_names(itinerary)
+    total = len(extracted)
+
+    # ── 1. RAG 커버리지 ────────────────────────────────────────────────────
+    retrieved_names = {p["장소명"] for p in retrieved_places}
+
+    def _matched(name: str) -> bool:
+        if name in retrieved_names:
+            return True
+        return any(name in r or r in name for r in retrieved_names)
+
+    if total > 0:
+        matched_count = sum(1 for n in extracted if _matched(n))
+        score_coverage = matched_count / total
+    else:
+        matched_count = 0
+        score_coverage = 0.0
+
+    # ── 2. 지역 일치도 ────────────────────────────────────────────────────
+    region_scores: list[float] = []
+    for p in retrieved_places:
+        sigungu = p.get("sigungu", "")
+        reg     = p.get("region", "")
+        address = p.get("주소", "")
+        if region and (sigungu == region or reg == region):
+            region_scores.append(1.0)
+        elif region and (region in reg or region in address):
+            region_scores.append(0.7)
+        else:
+            region_scores.append(0.4)
+    score_region = sum(region_scores) / len(region_scores) if region_scores else 0.5
+
+    # ── 3. 성향 일치도 ────────────────────────────────────────────────────
+    if retrieved_places:
+        matched_persona = sum(
+            1 for p in retrieved_places if personality in p.get("personality_tags", [])
+        )
+        score_personality = matched_persona / len(retrieved_places)
+    else:
+        matched_persona = 0
+        score_personality = 0.0
+
+    # ── 4. 데이터 충분성 ─────────────────────────────────────────────────
+    n = len(retrieved_places)
+    if n >= 15:
+        score_data = 1.0
+    elif n >= 10:
+        score_data = 0.8
+    elif n >= 5:
+        score_data = 0.6
+    else:
+        score_data = 0.4
+
+    # ── 할루시네이션 보너스 ───────────────────────────────────────────────
+    hallucination_bonus = 0.0
+    if validation and validation.get("is_clean") and total > 0:
+        hallucination_bonus = 0.03
+
+    # ── 최종 점수 ─────────────────────────────────────────────────────────
+    raw_score = (
+        0.35 * score_coverage
+        + 0.25 * score_region
+        + 0.25 * score_personality
+        + 0.15 * score_data
+        + hallucination_bonus
+    )
+    score = min(raw_score, 1.0)
+
+    if score >= 0.85:
+        level, level_emoji = "높음", "🟢"
+    elif score >= 0.65:
+        level, level_emoji = "보통", "🟡"
+    else:
+        level, level_emoji = "낮음", "🔴"
+
+    return {
+        "score":         score,
+        "level":         level,
+        "level_emoji":   level_emoji,
+        "details": {
+            "coverage":         round(score_coverage * 100),
+            "matched_count":    matched_count,
+            "total_places":     total,
+            "region_score":     round(score_region * 100),
+            "region":           region,
+            "personality_pct":  round(score_personality * 100),
+            "data_count":       n,
+            "hallucination_ok": bool(validation and validation.get("is_clean")),
+        },
+    }
+
+
+def _category_of(name: str, places: list[dict]) -> str:
+    """장소 목록에서 이름으로 카테고리를 조회한다. 정확 일치 우선, 부분 일치 차순."""
+    for p in places:
+        if p["장소명"] == name:
+            return p.get("카테고리", "")
+    for p in places:
+        if name in p["장소명"] or p["장소명"] in name:
+            return p.get("카테고리", "")
+    return ""
+
+
+def _replace_place(old_name: str) -> bool:
+    """
+    일정 텍스트에서 old_name을 후보 장소로 교체한다.
+
+    - candidate_pool + retrieved_places 합산에서 현재 일정에 없는 장소를 선별
+    - 같은 카테고리 → 성향 일치 순으로 정렬하여 최선 후보를 선택
+    - st.session_state.itinerary 를 직접 수정하고 True 반환
+    - 교체 불가 시 False 반환
+    """
+    itinerary = st.session_state.itinerary
+    retrieved = st.session_state.get("retrieved_places", [])
+    pool = st.session_state.get("candidate_pool", [])
+    personality = st.session_state.get("personality", "")
+
+    all_data = retrieved + pool
+
+    # 현재 일정에 등장하는 장소명 집합
+    used_names: set[str] = set()
+    for d in _parse_itinerary(itinerary):
+        for p in d["places"]:
+            used_names.add(p["name"])
+
+    category = _category_of(old_name, all_data)
+
+    # 이미 일정에 있는 장소 제외 (장소명 완전 일치)
+    candidates = [
+        p for p in all_data
+        if p["장소명"] not in used_names
+    ]
+
+    if not candidates:
+        return False
+
+    # 점수: 같은 카테고리 +2, 성향 일치 +1
+    def _score(p: dict) -> int:
+        s = 0
+        if category and p.get("카테고리", "") == category:
+            s += 2
+        if personality and personality in p.get("personality_tags", []):
+            s += 1
+        return s
+
+    candidates.sort(key=_score, reverse=True)
+    new_place = candidates[0]
+    new_name = new_place["장소명"]
+
+    # 일정 텍스트에서 해당 타임슬롯 줄의 장소명만 정밀 교체
+    pattern = re.compile(
+        r"^(\d{2}:\d{2}\s*-\s*\d{2}:\d{2}\s+)" + re.escape(old_name) + r"(\s*)$",
+        re.MULTILINE,
+    )
+    new_itinerary, count = pattern.subn(r"\g<1>" + new_name + r"\g<2>", itinerary)
+
+    if count == 0:
+        return False
+
+    st.session_state.itinerary = new_itinerary
+    st.session_state["_replace_flash"] = (
+        f"✅ '{old_name}' → '{new_name}' 으로 교체되었습니다."
+    )
+    return True
 
 
 def generate_itinerary(
@@ -526,6 +889,210 @@ def generate_itinerary(
     return full_text
 
 
+# ── 추천 파이프라인 ────────────────────────────────────────────────────────────
+def run_recommendation_pipeline(
+    personality: str,
+    region: str,
+    days: int,
+    weather: str,
+    budget: str,
+    travel_style: float,
+    crowd: str,
+) -> None:
+    """RAG 검색 → 일정 생성 → 검증의 전체 파이프라인을 단계별 로딩 UX와 함께 실행한다."""
+    import time
+
+    _status = st.empty()
+    _bar    = st.progress(0)
+
+    # ── STEP 1: 장소 검색 ────────────────────────────────────────────────────
+    _status.info("🔍 **여행 장소 검색 중...** RAG 데이터베이스에서 맞춤 장소를 찾고 있습니다.")
+    _bar.progress(10)
+
+    api_key      = st.secrets.get("OPENAI_API_KEY", "")
+    vectorstore  = build_vectorstore(api_key)
+    _bar.progress(25)
+
+    query = (
+        f"{personality} "
+        f"{get_personality_keywords(personality)} "
+        f"{region}"
+    )
+    style_label = _style_label(travel_style)
+    _status.info("🔍 **Hybrid 검색 중...** FAISS + BM25로 후보 장소를 추출하고 있습니다.")
+    rag_result     = retrieve_places(
+        vectorstore, query, region, top_k=15,
+        personality=personality,
+        weather=weather, budget=budget, crowd=crowd,
+        style=style_label,
+        llm=get_llm(streaming=False),
+    )
+    _bar.progress(33)
+    _status.info("🎯 **의미 기반 재정렬 중...** 사용자 의도에 맞게 장소 순위를 조정하고 있습니다.")
+    _bar.progress(40)
+    retrieved      = rag_result["main_places"]
+    candidate_pool = rag_result["candidate_pool"]
+    st.session_state.retrieved_places = retrieved
+    st.session_state.candidate_pool   = candidate_pool
+
+    # ── STEP 2: 일정 생성 ────────────────────────────────────────────────────
+    place_count = len(retrieved)
+    _status.info(
+        f"🗺️ **일정 생성 중...** {place_count}개 장소를 바탕으로 "
+        f"{days}일 일정을 구성하고 있습니다."
+    )
+    _bar.progress(45)
+
+    st.session_state.itinerary = generate_itinerary(
+        personality, region, days,
+        retrieved if retrieved else None,
+        travel_style=travel_style,
+        weather=weather, budget=budget, crowd=crowd,
+        candidate_pool=candidate_pool if candidate_pool else None,
+    )
+    _bar.progress(80)
+
+    # ── STEP 3: 검증 & 신뢰도 계산 ──────────────────────────────────────────
+    if retrieved:
+        _status.info("🔎 **추천 결과 검증 중...** 장소 신뢰도를 계산하고 있습니다.")
+
+        result = validate_itinerary(st.session_state.itinerary, retrieved)
+        st.session_state["validation"] = result
+        _bar.progress(85)
+
+        st.session_state["reason_summary"] = generate_reason_summary(
+            personality=personality, region=region,
+            weather=weather, budget=budget, crowd=crowd,
+            travel_style=travel_style, retrieved_places=retrieved,
+        )
+        _bar.progress(91)
+
+        st.session_state["confidence_result"] = calculate_confidence(
+            itinerary=st.session_state.itinerary,
+            retrieved_places=retrieved,
+            personality=personality, region=region,
+            validation=st.session_state.get("validation"),
+        )
+        _bar.progress(96)
+    else:
+        st.session_state.pop("validation", None)
+        st.session_state.pop("reason_summary", None)
+        st.session_state["confidence_result"] = None
+        st.session_state["tldr_summary"] = ""
+
+    # ── STEP 4: TL;DR 요약 생성 ──────────────────────────────────────────────
+    _status.info("📝 **일정 요약 생성 중...** 핵심 내용을 정리하고 있습니다.")
+    st.session_state["tldr_summary"] = generate_tldr_summary(
+        itinerary=st.session_state.itinerary,
+        personality=personality,
+        travel_style=travel_style,
+    )
+
+    # ── 완료 ─────────────────────────────────────────────────────────────────
+    _bar.progress(100)
+    _status.success("✅ 여행 일정 생성 완료!")
+    time.sleep(0.8)
+    _status.empty()
+    _bar.empty()
+
+
+# ── 진행 단계 표시 ────────────────────────────────────────────────────────────
+def render_step_indicator() -> None:
+    """현재 진행 단계를 상단에 항상 표시한다."""
+    stage = st.session_state.get("stage", 1)
+    has_itinerary = bool(st.session_state.get("itinerary", ""))
+
+    # session_state → UX 단계 (1~4) 변환
+    if has_itinerary:
+        ux_step = 4
+    elif stage == 4:
+        ux_step = 3
+    elif stage == 3:
+        ux_step = 2
+    else:
+        ux_step = 1
+
+    steps = [
+        ("성향 입력",  "여행 스타일과 취향을 분석합니다"),
+        ("조건 선택",  "날씨·예산·혼잡도를 설정합니다"),
+        ("추천 생성",  "RAG 기반으로 맞춤 일정을 생성합니다"),
+        ("결과 확인",  "생성된 여행 일정을 확인하고 교체합니다"),
+    ]
+
+    progress_pct = {1: 0, 2: 33, 3: 66, 4: 100}[ux_step]
+    current_label, current_desc = steps[ux_step - 1]
+
+    def _circle(idx: int) -> str:
+        """단계별 원형 아이콘 HTML 반환."""
+        if idx < ux_step:        # 완료
+            bg, fg, inner = "#4a7afe", "white", "✓"
+            label_color = "#4a7afe"
+            label_weight = "600"
+        elif idx == ux_step:     # 현재
+            bg, fg, inner = "#4a7afe", "white", str(idx)
+            label_color = "#1a1a2e"
+            label_weight = "700"
+        else:                    # 미진행
+            bg, fg, inner = "#e0e6f0", "#aaa", str(idx)
+            label_color = "#aaa"
+            label_weight = "400"
+
+        label = steps[idx - 1][0]
+        return (
+            f"<div style='display:flex;flex-direction:column;align-items:center;min-width:72px;'>"
+            f"  <div style='width:34px;height:34px;border-radius:50%;"
+            f"    background:{bg};color:{fg};display:flex;align-items:center;"
+            f"    justify-content:center;font-size:14px;font-weight:700;"
+            f"    box-shadow:0 2px 6px {bg}55;'>{inner}</div>"
+            f"  <div style='font-size:11px;margin-top:5px;color:{label_color};"
+            f"    font-weight:{label_weight};text-align:center;'>{label}</div>"
+            f"</div>"
+        )
+
+    def _connector(idx: int) -> str:
+        """단계 사이 연결선 HTML 반환."""
+        filled = idx < ux_step
+        color = "#4a7afe" if filled else "#e0e6f0"
+        return (
+            f"<div style='flex:1;height:2px;background:{color};"
+            f"margin-bottom:20px;min-width:20px;'></div>"
+        )
+
+    # 원 + 연결선 조합
+    row_html = "<div style='display:flex;align-items:center;justify-content:center;'>"
+    for i in range(1, 5):
+        row_html += _circle(i)
+        if i < 4:
+            row_html += _connector(i)
+    row_html += "</div>"
+
+    # 진행률 바
+    bar_html = (
+        f"<div style='background:#e0e6f0;border-radius:4px;height:4px;"
+        f"margin:10px 0 6px 0;overflow:hidden;'>"
+        f"  <div style='width:{progress_pct}%;height:100%;background:#4a7afe;"
+        f"    transition:width 0.4s ease;'></div>"
+        f"</div>"
+    )
+
+    # 현재 단계 설명
+    desc_html = (
+        f"<div style='text-align:center;font-size:12px;color:#666;margin-top:2px;'>"
+        f"  <span style='color:#4a7afe;font-weight:600;'>STEP {ux_step}</span>"
+        f"  &nbsp;·&nbsp; {current_desc}"
+        f"  &nbsp;<span style='color:#aaa;'>({progress_pct}% 완료)</span>"
+        f"</div>"
+    )
+
+    st.markdown(
+        f"<div style='padding:14px 18px 10px 18px;background:#f8f9ff;"
+        f"border:1px solid #e0e6f0;border-radius:12px;margin-bottom:16px;'>"
+        f"{row_html}{bar_html}{desc_html}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
 # ── 인증 게이트 ───────────────────────────────────────────────────────────────
 if not require_auth():
     show_login_ui()
@@ -544,20 +1111,7 @@ with st.sidebar:
 
 render_saved_plans()
 
-# 진행 단계 표시
-step_labels = ["성향 질문", "성향 분석", "여행 정보", "일정 생성"]
-cols = st.columns(4)
-for i, (col, label) in enumerate(zip(cols, step_labels), start=1):
-    with col:
-        if st.session_state.stage > i:
-            st.success(f"{i}. {label}")
-        elif st.session_state.stage == i:
-            st.info(f"{i}. {label}")
-        else:
-            st.markdown(
-                f"<div style='text-align:center; color:gray;'>{i}. {label}</div>",
-                unsafe_allow_html=True,
-            )
+render_step_indicator()
 
 st.divider()
 
@@ -592,8 +1146,17 @@ elif st.session_state.stage == 2:
     st.subheader("2단계  여행 성향 분석 중...")
 
     if st.session_state.personality is None:
-        with st.spinner("답변을 분석하고 있습니다..."):
-            st.session_state.personality = analyze_personality(st.session_state.answers)
+        import time as _t
+        _s2_status = st.empty()
+        _s2_bar    = st.progress(0)
+        _s2_status.info("🧠 **성향 분석 중...** 답변을 기반으로 여행 스타일을 분석하고 있습니다.")
+        _s2_bar.progress(30)
+        st.session_state.personality = analyze_personality(st.session_state.answers)
+        _s2_bar.progress(100)
+        _s2_status.success("✅ 성향 분석 완료!")
+        _t.sleep(0.6)
+        _s2_status.empty()
+        _s2_bar.empty()
 
     personality = st.session_state.personality
     desc = PERSONALITY_DESC.get(personality, "나만의 여행 스타일을 가진 타입")
@@ -766,113 +1329,36 @@ elif st.session_state.stage == 4:
             )
 
         if st.button("🔁 조건 수정 후 재추천", use_container_width=True):
-            # 1. session_state 갱신
             st.session_state["weather"]       = new_weather
             st.session_state["budget"]        = new_budget
             st.session_state["travel_style"]  = new_style
             st.session_state["crowd"]         = new_crowd
+            st.session_state.itinerary        = ""
 
-            with st.spinner("새로운 여행 계획 생성 중..."):
-                # 2. RAG 재검색
-                api_key = st.secrets.get("OPENAI_API_KEY", "")
-                vectorstore = build_vectorstore(api_key)
-                query = (
-                    f"{st.session_state.personality} "
-                    f"{get_personality_keywords(st.session_state.personality)} "
-                    f"{st.session_state.region}"
-                )
-                rag_result = retrieve_places(
-                    vectorstore, query, st.session_state.region, top_k=15,
-                    personality=st.session_state.personality,
-                    weather=new_weather, budget=new_budget, crowd=new_crowd,
-                )
-                retrieved      = rag_result["main_places"]
-                candidate_pool = rag_result["candidate_pool"]
-                st.session_state.retrieved_places = retrieved
-                st.session_state.candidate_pool   = candidate_pool
-
-                # 3. 일정 재생성
-                st.session_state.itinerary = generate_itinerary(
-                    st.session_state.personality,
-                    st.session_state.region,
-                    days,
-                    retrieved if retrieved else None,
-                    travel_style=new_style,
-                    weather=new_weather,
-                    budget=new_budget,
-                    crowd=new_crowd,
-                    candidate_pool=candidate_pool if candidate_pool else None,
-                )
-
-                # 4. 검증
-                if retrieved:
-                    st.session_state["validation"] = validate_itinerary(
-                        st.session_state.itinerary, retrieved
-                    )
-                else:
-                    st.session_state.pop("validation", None)
-
-            st.success("새로운 여행 일정이 생성되었습니다!")
+            run_recommendation_pipeline(
+                personality=st.session_state.personality,
+                region=st.session_state.region,
+                days=days,
+                weather=new_weather,
+                budget=new_budget,
+                travel_style=new_style,
+                crowd=new_crowd,
+            )
             st.rerun()
     # ─────────────────────────────────────────────────────────────────────────
 
     st.divider()
 
     if not st.session_state.itinerary:
-        # ── RAG: 벡터 스토어 빌드 + 장소 검색 ───────────────────────────────
-        api_key = st.secrets.get("OPENAI_API_KEY", "")
-        vectorstore = build_vectorstore(api_key)
-
-        query = (
-            f"{st.session_state.personality} "
-            f"{get_personality_keywords(st.session_state.personality)} "
-            f"{st.session_state.region}"
-        )
-        rag_result = retrieve_places(
-            vectorstore,
-            query,
-            st.session_state.region,
-            top_k=15,
+        run_recommendation_pipeline(
             personality=st.session_state.personality,
+            region=st.session_state.region,
+            days=days,
             weather=st.session_state.get("weather", "자동"),
             budget=st.session_state.get("budget", "상관없음"),
-            crowd=st.session_state.get("crowd", "상관없음"),
-        )
-        retrieved      = rag_result["main_places"]
-        candidate_pool = rag_result["candidate_pool"]
-        st.session_state.retrieved_places  = retrieved
-        st.session_state.candidate_pool    = candidate_pool
-
-        # RAG 검색 결과 요약 표시
-        if retrieved:
-            with st.expander(f"RAG 검색된 후보 장소 {len(retrieved)}개 보기"):
-                for p in retrieved:
-                    st.markdown(f"- **{p['장소명']}** ({p['카테고리']}) — {p['주소']}")
-            with st.expander(f"전체 후보 풀 {len(candidate_pool)}개 보기 (대안용)"):
-                for p in candidate_pool:
-                    st.markdown(f"- **{p['장소명']}** ({p['카테고리']}) — {p['주소']}")
-
-        # ── 일정 생성 (RAG 컨텍스트 주입) ───────────────────────────────────
-        st.session_state.itinerary = generate_itinerary(
-            st.session_state.personality,
-            st.session_state.region,
-            days,
-            retrieved if retrieved else None,
             travel_style=float(st.session_state.get("travel_style", 0.5)),
-            weather=st.session_state.get("weather", "자동"),
-            budget=st.session_state.get("budget", "상관없음"),
             crowd=st.session_state.get("crowd", "상관없음"),
-            candidate_pool=candidate_pool if candidate_pool else None,
         )
-
-        # ── 검증 로직 ────────────────────────────────────────────────────────
-        if retrieved:
-            result = validate_itinerary(
-                st.session_state.itinerary,
-                st.session_state.retrieved_places,
-            )
-            st.session_state["validation"] = result
-
         st.rerun()
     else:
         # ── 저장된 일정 보기 모드 ─────────────────────────────────────────────
@@ -894,22 +1380,137 @@ elif st.session_state.stage == 4:
                     st.rerun()
                 st.stop()
 
-        render_timeline(st.session_state.itinerary)
+        # ── TL;DR 요약 ──────────────────────────────────────────────────────
+        tldr = st.session_state.get("tldr_summary", "")
+        if tldr:
+            st.markdown("### 📌 한눈에 보는 여행 요약")
+            tldr_lines = [l.strip() for l in tldr.splitlines() if l.strip()]
+            if tldr_lines:
+                items_html = "".join(
+                    f"<p style='margin:6px 0; font-size:14px; color:#1a1a2e;'>{l}</p>"
+                    for l in tldr_lines
+                )
+                st.markdown(
+                    "<div style='"
+                    "background:#fffdf0; border:1px solid #ffe08a;"
+                    "border-left:4px solid #f5a623; border-radius:10px;"
+                    "padding:14px 18px; margin-bottom:16px;'>"
+                    f"<p style='margin:0 0 8px 0; font-size:13px; font-weight:700;"
+                    f"color:#b07d00;'>TL;DR — 핵심만 먼저 확인하세요</p>"
+                    + items_html
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+        # ── 추천 근거 요약 ───────────────────────────────────────────────────
+        reason_summary = st.session_state.get("reason_summary", "")
+        if reason_summary:
+            st.markdown("### 📌 추천 기준 요약")
+            lines = [l.strip() for l in reason_summary.splitlines() if l.strip().startswith("-")]
+            if lines:
+                st.markdown(
+                    "<div style='"
+                    "background:#f8f9ff; border:1px solid #d0d8ff;"
+                    "border-left:4px solid #4a7afe; border-radius:10px;"
+                    "padding:14px 18px; margin-bottom:16px;'>"
+                    + "".join(
+                        f"<p style='margin:4px 0; font-size:14px; color:#2c2c4a;'>{l}</p>"
+                        for l in lines
+                    )
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.info(reason_summary)
+
+        # ── 추천 신뢰도 표시 ──────────────────────────────────────────────────
+        cr = st.session_state.get("confidence_result")
+        if cr:
+            d = cr["details"]
+            pct = round(cr["score"] * 100)
+            level_color = {"높음": "#1a7f37", "보통": "#9a6700", "낮음": "#cf222e"}
+            level_bg    = {"높음": "#dafbe1", "보통": "#fff8c5", "낮음": "#ffebe9"}
+            color = level_color.get(cr["level"], "#555")
+            bg    = level_bg.get(cr["level"], "#f5f5f5")
+
+            hal_line = (
+                "<p style='margin:3px 0; font-size:13px; color:#2c2c4a;'>"
+                "✅ 할루시네이션 없음 — 모든 장소가 RAG 검색 결과에서 확인됨</p>"
+                if d["hallucination_ok"] else ""
+            )
+
+            st.markdown(
+                f"<div style='background:{bg}; border:1px solid {color}33;"
+                f"border-left:4px solid {color}; border-radius:10px;"
+                f"padding:14px 18px; margin-bottom:16px;'>"
+                f"<p style='margin:0 0 8px 0; font-size:15px; font-weight:700; color:{color};'>"
+                f"🔍 추천 신뢰도: {cr['level']} {cr['level_emoji']} ({pct}%)</p>"
+                f"<p style='margin:3px 0; font-size:13px; color:#2c2c4a;'>"
+                f"📦 RAG 커버리지: {d['matched_count']}/{d['total_places']}개 일치 "
+                f"({d['coverage']}%)</p>"
+                f"<p style='margin:3px 0; font-size:13px; color:#2c2c4a;'>"
+                f"📍 지역 일치도: {d['region']} ({d['region_score']}%)</p>"
+                f"<p style='margin:3px 0; font-size:13px; color:#2c2c4a;'>"
+                f"🧭 성향 일치율: {d['personality_pct']}%</p>"
+                f"<p style='margin:3px 0; font-size:13px; color:#2c2c4a;'>"
+                f"🗂️ 검색 데이터: {d['data_count']}개</p>"
+                f"{hal_line}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        render_timeline(st.session_state.itinerary, interactive=True)
 
         # ── 일정 저장 버튼 ───────────────────────────────────────────────────
         already_saved = any(
             p["itinerary"] == st.session_state.itinerary
             for p in st.session_state.get("saved_plans", [])
         )
+        st.divider()
         if already_saved:
             st.success("✅ 이미 저장된 일정입니다.")
-        elif st.button("💾 일정 저장하기", use_container_width=True):
-            save_plan(days)
-            st.success(
-                f"일정이 저장되었습니다! "
-                f"(총 {len(st.session_state['saved_plans'])}개 저장됨)"
+        else:
+            default_title = f"{st.session_state.get('personality', '미정')} · {st.session_state.get('region', '미입력')} {days}일"
+            plan_title = st.text_input(
+                "📝 일정 제목",
+                value=default_title,
+                placeholder="저장할 일정의 제목을 입력하세요",
+                key="plan_title_input",
             )
-            st.rerun()
+            if st.button("💾 일정 저장하기", use_container_width=True):
+                save_plan(days, title=plan_title)
+                st.success(
+                    f"'{plan_title}' 일정이 저장되었습니다! "
+                    f"(총 {len(st.session_state['saved_plans'])}개 저장됨)"
+                )
+                st.rerun()
+
+        # 현재 일정 JSON 내보내기
+        _export_title = next(
+            (p["title"] for p in st.session_state.get("saved_plans", []) if p["itinerary"] == st.session_state.itinerary),
+            st.session_state.get("plan_title_input", f"{st.session_state.get('personality', '미정')} · {st.session_state.get('region', '미입력')} {days}일"),
+        )
+        current_plan_data = {
+            "title": _export_title,
+            "personality":  st.session_state.get("personality", ""),
+            "region":       st.session_state.get("region", ""),
+            "days":         days,
+            "weather":      st.session_state.get("weather", "자동"),
+            "budget":       st.session_state.get("budget", "상관없음"),
+            "travel_style": float(st.session_state.get("travel_style", 0.5)),
+            "crowd":        st.session_state.get("crowd", "상관없음"),
+            "itinerary":    st.session_state.get("itinerary", ""),
+            "tldr_summary": st.session_state.get("tldr_summary", ""),
+            "exported_at":  datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        st.download_button(
+            label="📤 현재 일정 JSON 내보내기",
+            data=json.dumps(current_plan_data, ensure_ascii=False, indent=2),
+            file_name=f"travel_plan_{st.session_state.get('region', 'plan')}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="export_current_plan",
+        )
 
     # ── 검증 결과 표시 ───────────────────────────────────────────────────────
     if st.session_state.get("validation"):
@@ -964,6 +1565,8 @@ elif st.session_state.stage == 4:
                         weather=st.session_state.get("weather", "자동"),
                         budget=st.session_state.get("budget", "상관없음"),
                         crowd=st.session_state.get("crowd", "상관없음"),
+                        style=_style_label(float(st.session_state.get("travel_style", 0.5))),
+                        llm=get_llm(streaming=False),
                     )
                     retrieved      = rag_result["main_places"]
                     candidate_pool = rag_result["candidate_pool"]
@@ -986,8 +1589,33 @@ elif st.session_state.stage == 4:
                         st.session_state["validation"] = validate_itinerary(
                             st.session_state.itinerary, retrieved
                         )
+                        st.session_state["reason_summary"] = generate_reason_summary(
+                            personality=alt_p,
+                            region=st.session_state.region,
+                            weather=st.session_state.get("weather", "자동"),
+                            budget=st.session_state.get("budget", "상관없음"),
+                            crowd=st.session_state.get("crowd", "상관없음"),
+                            travel_style=float(st.session_state.get("travel_style", 0.5)),
+                            retrieved_places=retrieved,
+                        )
+                        st.session_state["confidence_result"] = calculate_confidence(
+                            itinerary=st.session_state.itinerary,
+                            retrieved_places=retrieved,
+                            personality=alt_p,
+                            region=st.session_state.region,
+                            validation=st.session_state.get("validation"),
+                        )
+                        st.session_state["tldr_summary"] = generate_tldr_summary(
+                            itinerary=st.session_state.itinerary,
+                            personality=alt_p,
+                            travel_style=float(st.session_state.get("travel_style", 0.5)),
+                        )
                     else:
                         st.session_state.pop("validation", None)
+                        st.session_state.pop("reason_summary", None)
+                        st.session_state["confidence_result"] = None
+                        st.session_state["tldr_summary"] = ""
+                        st.session_state["tldr_summary"] = ""
 
                 st.rerun()
     # ─────────────────────────────────────────────────────────────────────────
@@ -1000,10 +1628,15 @@ elif st.session_state.stage == 4:
             st.session_state.retrieved_places = []
             st.session_state.candidate_pool = []
             st.session_state.pop("validation", None)
+            st.session_state.pop("reason_summary", None)
+            st.session_state["confidence_result"] = None
+            st.session_state["tldr_summary"] = ""
             st.rerun()
     with col_b:
         if st.button("처음부터 다시", use_container_width=True):
             for k, v in defaults.items():
                 st.session_state[k] = v
             st.session_state.pop("validation", None)
+            st.session_state.pop("reason_summary", None)
+            st.session_state["confidence_result"] = None
             st.rerun()
