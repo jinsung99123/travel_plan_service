@@ -6,6 +6,7 @@
   - Contextual Embedding : loader가 생성한 성향/지역/카테고리 컨텍스트 포함 page_content로 임베딩
   - Contextual BM25      : rank_bm25 기반 키워드 검색 (카테고리 + keywords + 설명 토큰화)
   - Hybrid Search        : FAISS(0.6) + BM25(0.4) 정규화 점수 결합, 동일 문서 합산
+                           BM25에 rewrite keywords 추가 토큰으로 강화 가능
   - Metadata Score       : personality_tags·category 불일치 시 점수 penalty 적용
   - Semantic Reranking   : LLM 기반 사용자 의도 적합도 재정렬 (base*0.7 + rerank*0.3)
 """
@@ -138,6 +139,7 @@ def hybrid_search(
     query: str,
     top_n: int,
     alpha: float = 0.6,
+    bm25_extra_tokens: list[str] | None = None,
 ) -> list[tuple[dict, float]]:
     """
     FAISS + BM25 하이브리드 검색.
@@ -146,15 +148,25 @@ def hybrid_search(
               = 0.6  * embedding_score       + 0.4       * bm25_score
 
     처리 흐름:
-      1. FAISS top_n 검색 → L2 → 유사도 변환 → min-max 정규화
-      2. BM25 top_n 검색 → min-max 정규화
+      1. FAISS top_n 검색 → L2 → 유사도 변환 → min-max 정규화 (query 사용)
+      2. BM25 top_n 검색 → min-max 정규화 (query + bm25_extra_tokens 사용)
       3. id 기준 점수 합산 (FAISS에만 있는 문서: alpha 가중치만, BM25에만: (1-alpha)만)
       4. 최종 점수 내림차순 정렬
+
+    bm25_extra_tokens: Query Rewrite 에서 추출한 키워드를 BM25 쿼리에 추가로 반영.
+                       FAISS는 rewritten_query의 임베딩을 사용하고,
+                       BM25는 rewritten_query + extra_tokens 조합으로 키워드 검색 강화.
     """
     bm25, corpus_metadata = build_bm25_index()
 
     faiss_normalized = _normalize_scores(_faiss_search(vectorstore, query, top_n))
-    bm25_normalized = _normalize_scores(_bm25_search(bm25, corpus_metadata, query, top_n))
+
+    # BM25 쿼리: 기본 쿼리 + rewrite 키워드 토큰 병합
+    if bm25_extra_tokens:
+        bm25_query = query + " " + " ".join(bm25_extra_tokens)
+    else:
+        bm25_query = query
+    bm25_normalized = _normalize_scores(_bm25_search(bm25, corpus_metadata, bm25_query, top_n))
 
     combined: dict[int, tuple[dict, float]] = {}
 
@@ -437,6 +449,7 @@ def retrieve_places(
     crowd: str = "",
     style: str = "",
     llm: "ChatOpenAI | None" = None,
+    keywords: list[str] | None = None,
 ) -> dict:
     """
     Contextual Hybrid Retrieval — 검색 풀 확장 + 카테고리 다양성 + 대안 후보 반환.
@@ -459,7 +472,8 @@ def retrieve_places(
       }
     """
     # 1. Hybrid 후보 검색 (풀 확장: top_k*6)
-    candidates = hybrid_search(vectorstore, query, top_k * 6)
+    # FAISS: rewritten_query 임베딩 사용 / BM25: rewritten_query + keywords 병합으로 강화
+    candidates = hybrid_search(vectorstore, query, top_k * 6, bm25_extra_tokens=keywords or [])
 
     # 2. 기존 scoring 로직 유지 (변경 없음)
     candidates = [

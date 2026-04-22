@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import uuid
@@ -619,6 +620,240 @@ def _style_label(travel_style: float) -> str:
     return "보통"
 
 
+# ── Query Rewrite ─────────────────────────────────────────────────────────────
+REWRITE_SYSTEM_PROMPT = (
+    "너는 여행 추천 시스템의 검색 성능을 향상시키는 Query Rewriter다.\n\n"
+    "사용자의 자연어 요청을 분석하여:\n"
+    "1. 검색에 유리한 키워드를 추출하고\n"
+    "2. 의미를 명확히 하고\n"
+    "3. 검색 최적화된 문장으로 재작성하라.\n\n"
+    "Rewrite 규칙:\n"
+    "- 장소 유형(카페, 음식점, 공원 등), 분위기(조용한, 감성, 활기찬 등), "
+    "활동(산책, 사진, 데이트 등) 키워드를 추출하라.\n"
+    "- '좀', '약간', '괜찮은', '느낌' 등 검색에 불필요한 표현을 제거하라.\n"
+    "- '쉬고 싶다' → '조용한 카페 힐링 공간' 처럼 구체적 장소·활동으로 의미를 확장하라.\n"
+    "- 성향은 다음 중 하나로만 추론하라: 힐링형, 액티비티형, 탐방형, 미식형, 감성형, 균형형\n\n"
+    "출력은 반드시 아래 JSON 형식만 반환하라. 다른 텍스트 출력 금지.\n"
+    '{"original_query": "원본 쿼리", "rewritten_query": "검색 최적화 문장", '
+    '"keywords": ["키워드1", "키워드2"], "intent": "성향명"}'
+)
+
+_rewrite_prompt = ChatPromptTemplate.from_messages([
+    ("system", REWRITE_SYSTEM_PROMPT),
+    ("human", "{user_input}"),
+])
+
+# 모듈 레벨 캐시: {md5_key: result_dict}
+_REWRITE_CACHE: dict[str, dict] = {}
+
+
+def _rewrite_cache_key(query: str, personality: str, region: str) -> str:
+    raw = f"{query}|{personality}|{region}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def rewrite_query(
+    user_input: str,
+    personality: str = "",
+    region: str = "",
+) -> dict:
+    """
+    사용자 쿼리를 검색 최적화 형태로 재작성한다.
+
+    반환:
+      {
+        "original_query":  원본 쿼리,
+        "rewritten_query": 검색 최적화 문장 (FAISS 임베딩 입력),
+        "keywords":        추출 키워드 리스트 (BM25 추가 토큰),
+        "intent":          추론 성향,
+      }
+    LLM 실패 또는 API 키 없음 시 원본 쿼리 그대로 반환 (fallback).
+    동일 입력은 모듈 레벨 dict로 캐싱하여 LLM 재호출 방지.
+    """
+    cache_key = _rewrite_cache_key(user_input, personality, region)
+    if cache_key in _REWRITE_CACHE:
+        return _REWRITE_CACHE[cache_key]
+
+    fallback = {
+        "original_query":  user_input,
+        "rewritten_query": user_input,
+        "keywords":        [],
+        "intent":          personality,
+    }
+
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
+        if not api_key:
+            return fallback
+
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0.3,
+            openai_api_key=api_key,
+        )
+        chain = _rewrite_prompt | llm | StrOutputParser()
+        raw = chain.invoke({"user_input": user_input}).strip()
+
+        if raw.startswith("```"):
+            raw = re.sub(r"```[a-z]*\n?", "", raw).strip("` \n")
+
+        parsed = json.loads(raw)
+        result = {
+            "original_query":  str(parsed.get("original_query", user_input)),
+            "rewritten_query": str(parsed.get("rewritten_query", user_input)),
+            "keywords":        [str(k) for k in parsed.get("keywords", [])],
+            "intent":          str(parsed.get("intent", personality)),
+        }
+
+        print(
+            f"[query rewrite]\n"
+            f"  input:     {result['original_query']}\n"
+            f"  rewritten: {result['rewritten_query']}\n"
+            f"  keywords:  {result['keywords']}\n"
+            f"  intent:    {result['intent']}"
+        )
+
+        _REWRITE_CACHE[cache_key] = result
+        return result
+
+    except Exception as exc:
+        print(f"[query rewrite] 실패: {exc} — 원본 쿼리 유지")
+        return fallback
+
+
+# ── Multi-step Retrieval ──────────────────────────────────────────────────────
+MULTI_STEP_SYSTEM_PROMPT = (
+    "너는 복잡한 여행 요청을 여러 단계로 나누는 Query Planner다.\n\n"
+    "사용자의 요청을 분석하여:\n"
+    "1. 독립적인 검색이 가능한 하위 쿼리로 분해하라.\n"
+    "2. 각 쿼리는 명확한 장소 유형과 목적을 가져야 한다.\n\n"
+    "조건:\n"
+    "- 최대 3개 이하로 분해하라.\n"
+    "- 단순 쿼리(하나의 장소 유형만 포함)는 분해하지 말고 그대로 반환하라.\n"
+    "- 의미 중복 금지.\n"
+    "- 검색 가능한 형태로 작성하라.\n\n"
+    '출력은 JSON으로만: {"original_query": "...", "sub_queries": ["쿼리1", "쿼리2"]}'
+)
+
+_multi_step_prompt = ChatPromptTemplate.from_messages([
+    ("system", MULTI_STEP_SYSTEM_PROMPT),
+    ("human", "{user_input}"),
+])
+
+_DECOMPOSE_CACHE: dict[str, dict] = {}
+
+
+def _decompose_cache_key(query: str) -> str:
+    return hashlib.md5(query.encode()).hexdigest()
+
+
+def decompose_query(query: str) -> dict:
+    """
+    복잡한 쿼리를 독립적인 하위 쿼리로 분해한다.
+
+    반환:
+      {
+        "original_query": 원본 쿼리,
+        "sub_queries":    하위 쿼리 리스트 (단순 쿼리면 [query] 그대로),
+      }
+    LLM 실패 시 fallback: {"original_query": query, "sub_queries": [query]}
+    동일 입력은 모듈 레벨 dict로 캐싱.
+    """
+    cache_key = _decompose_cache_key(query)
+    if cache_key in _DECOMPOSE_CACHE:
+        return _DECOMPOSE_CACHE[cache_key]
+
+    fallback = {"original_query": query, "sub_queries": [query]}
+
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
+        if not api_key:
+            return fallback
+
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.0, openai_api_key=api_key)
+        chain = _multi_step_prompt | llm | StrOutputParser()
+        raw = chain.invoke({"user_input": query}).strip()
+
+        if raw.startswith("```"):
+            raw = re.sub(r"```[a-z]*\n?", "", raw).strip("` \n")
+
+        parsed = json.loads(raw)
+        sub_queries = [str(q) for q in parsed.get("sub_queries", [query])]
+        sub_queries = sub_queries[:3]  # 최대 3개 제한
+        if not sub_queries:
+            sub_queries = [query]
+
+        result = {
+            "original_query": str(parsed.get("original_query", query)),
+            "sub_queries":    sub_queries,
+        }
+
+        print(
+            f"[multi-step]\n"
+            f"  original:    {result['original_query']}\n"
+            f"  sub_queries: {result['sub_queries']}"
+        )
+
+        _DECOMPOSE_CACHE[cache_key] = result
+        return result
+
+    except Exception as exc:
+        print(f"[multi-step] 분해 실패: {exc} — 원본 쿼리 유지")
+        return fallback
+
+
+def multi_step_retrieve(
+    vectorstore,
+    sub_queries: list[str],
+    region: str,
+    personality: str = "",
+    weather: str = "",
+    budget: str = "",
+    crowd: str = "",
+    style: str = "",
+    llm=None,
+    keywords: list[str] | None = None,
+    top_k: int = 15,
+) -> dict:
+    """
+    sub_queries 각각에 대해 retrieve_places()를 호출하고 결과를 병합한다.
+
+    병합 전략:
+    - main_places: id 기준 중복 제거, 먼저 나온 순서(max-score first-seen) 유지
+    - candidate_pool: 동일하게 중복 제거 후 병합
+    """
+    seen_ids: set[int] = set()
+    merged_main: list[dict] = []
+    merged_pool: list[dict] = []
+
+    for sq in sub_queries:
+        result = retrieve_places(
+            vectorstore, sq, region, top_k=top_k,
+            personality=personality,
+            weather=weather, budget=budget, crowd=crowd,
+            style=style, llm=llm,
+            keywords=keywords,
+        )
+        main = result.get("main_places", [])
+        pool = result.get("candidate_pool", [])
+
+        print(f"[results per query] '{sq}' → main={len(main)}, pool={len(pool)}")
+
+        for place in main:
+            pid = place.get("id")
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                merged_main.append(place)
+
+        for place in pool:
+            pid = place.get("id")
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                merged_pool.append(place)
+
+    return {"main_places": merged_main, "candidate_pool": merged_pool}
+
+
 def generate_reason_summary(
     personality: str,
     region: str,
@@ -911,7 +1146,7 @@ def run_recommendation_pipeline(
 
     api_key      = st.secrets.get("OPENAI_API_KEY", "")
     vectorstore  = build_vectorstore(api_key)
-    _bar.progress(25)
+    _bar.progress(20)
 
     query = (
         f"{personality} "
@@ -919,14 +1154,34 @@ def run_recommendation_pipeline(
         f"{region}"
     )
     style_label = _style_label(travel_style)
+
+    # ✅ Query Rewrite — retrieve_places 호출 직전
+    _status.info("✏️ **쿼리 최적화 중...** 검색 성능 향상을 위해 쿼리를 재작성하고 있습니다.")
+    _bar.progress(27)
+    rewrite = rewrite_query(query, personality=personality, region=region)
+    search_query       = rewrite["rewritten_query"]
+    search_personality = (
+        rewrite["intent"]
+        if rewrite["intent"] in PERSONALITY_TYPES
+        else personality
+    )
+
+    # ✅ Multi-step Retrieval — 복잡한 쿼리는 하위 쿼리로 분해 후 병합
     _status.info("🔍 **Hybrid 검색 중...** FAISS + BM25로 후보 장소를 추출하고 있습니다.")
-    rag_result     = retrieve_places(
-        vectorstore, query, region, top_k=15,
-        personality=personality,
+    decomposed    = decompose_query(search_query)
+    sub_queries   = decomposed["sub_queries"]
+    retrieve_kwargs = dict(
+        region=region, top_k=15,
+        personality=search_personality,
         weather=weather, budget=budget, crowd=crowd,
         style=style_label,
         llm=get_llm(streaming=False),
+        keywords=rewrite["keywords"],
     )
+    if len(sub_queries) > 1:
+        rag_result = multi_step_retrieve(vectorstore, sub_queries, **retrieve_kwargs)
+    else:
+        rag_result = retrieve_places(vectorstore, sub_queries[0], **retrieve_kwargs)
     _bar.progress(33)
     _status.info("🎯 **의미 기반 재정렬 중...** 사용자 의도에 맞게 장소 순위를 조정하고 있습니다.")
     _bar.progress(40)
@@ -1559,15 +1814,29 @@ elif st.session_state.stage == 4:
                         f"{get_personality_keywords(alt_p)} "
                         f"{st.session_state.region}"
                     )
-                    rag_result = retrieve_places(
-                        vectorstore, query, st.session_state.region, top_k=15,
+                    # ✅ Query Rewrite — 다른 성향 추천에도 적용
+                    rewrite = rewrite_query(
+                        query,
                         personality=alt_p,
+                        region=st.session_state.region,
+                    )
+                    # ✅ Multi-step Retrieval — 다른 성향 추천에도 적용
+                    alt_decomposed  = decompose_query(rewrite["rewritten_query"])
+                    alt_sub_queries = alt_decomposed["sub_queries"]
+                    alt_retrieve_kwargs = dict(
+                        region=st.session_state.region, top_k=15,
+                        personality=alt_p,  # 버튼으로 선택한 성향 유지 (intent 무시)
                         weather=st.session_state.get("weather", "자동"),
                         budget=st.session_state.get("budget", "상관없음"),
                         crowd=st.session_state.get("crowd", "상관없음"),
                         style=_style_label(float(st.session_state.get("travel_style", 0.5))),
                         llm=get_llm(streaming=False),
+                        keywords=rewrite["keywords"],
                     )
+                    if len(alt_sub_queries) > 1:
+                        rag_result = multi_step_retrieve(vectorstore, alt_sub_queries, **alt_retrieve_kwargs)
+                    else:
+                        rag_result = retrieve_places(vectorstore, alt_sub_queries[0], **alt_retrieve_kwargs)
                     retrieved      = rag_result["main_places"]
                     candidate_pool = rag_result["candidate_pool"]
                     st.session_state.retrieved_places = retrieved
