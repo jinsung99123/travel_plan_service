@@ -721,6 +721,121 @@ def rewrite_query(
         return fallback
 
 
+# ── Query Optimization ───────────────────────────────────────────────────────
+# 복합 연결 패턴: "도 하고", "하고 싶어", "도 가고", "그리고" 등
+_COMPLEX_PATTERN = re.compile(
+    r"도\s*하고|하고\s*싶|도\s*가고|도\s*먹고|그리고|뿐만\s*아니라|면서|며\s"
+)
+# 장소 카테고리 키워드 집합 (KEYWORD/MIXED 판별용)
+_PLACE_CATEGORIES = {
+    "카페", "음식점", "맛집", "공원", "박물관", "갤러리", "시장",
+    "쇼핑", "체험", "산책", "공연", "전시", "식당", "카페", "베이커리",
+}
+
+# 쿼리 타입별 전략 테이블
+_STRATEGY_MAP: dict[str, dict] = {
+    "KEYWORD":  {
+        "use_multi_step": False,
+        "faiss_weight":   0.3,
+        "bm25_weight":    0.7,
+        "rerank_weight":  0.2,
+        "top_k":          15,
+        "diversity":      0.2,
+    },
+    "SEMANTIC": {
+        "use_multi_step": False,
+        "faiss_weight":   0.7,
+        "bm25_weight":    0.3,
+        "rerank_weight":  0.4,
+        "top_k":          15,
+        "diversity":      0.3,
+    },
+    "MIXED": {
+        "use_multi_step": False,
+        "faiss_weight":   0.5,
+        "bm25_weight":    0.5,
+        "rerank_weight":  0.3,
+        "top_k":          20,
+        "diversity":      0.3,
+    },
+    "COMPLEX": {
+        "use_multi_step": True,
+        "faiss_weight":   0.5,
+        "bm25_weight":    0.5,
+        "rerank_weight":  0.4,
+        "top_k":          30,
+        "diversity":      0.5,
+    },
+}
+
+
+def _classify_query_type(rewritten_query: str, keywords: list[str], original_query: str) -> str:
+    """
+    쿼리를 KEYWORD / SEMANTIC / MIXED / COMPLEX 4종으로 분류한다.
+
+    분류 우선순위:
+      1. COMPLEX  — 원본 쿼리에 복합 연결 패턴 존재 (도 하고, 그리고, 면서 …)
+      2. KEYWORD  — 재작성 쿼리가 ≤3 토큰이고 키워드가 ≤2개 (단순 명사형)
+      3. SEMANTIC — 추출 키워드가 없거나 카테고리 교집합이 없음 (의미 중심 자연어)
+      4. MIXED    — 나머지 (키워드 + 의미 혼합)
+    """
+    # 1. COMPLEX
+    if _COMPLEX_PATTERN.search(original_query):
+        return "COMPLEX"
+
+    tokens = rewritten_query.split()
+    kw_count = len(keywords)
+
+    # 2. KEYWORD
+    if len(tokens) <= 3 and kw_count <= 2:
+        return "KEYWORD"
+
+    # 3. SEMANTIC
+    kw_set = {k.strip() for k in keywords}
+    if not (kw_set & _PLACE_CATEGORIES):
+        return "SEMANTIC"
+
+    # 4. MIXED (default)
+    return "MIXED"
+
+
+def optimize_query(rewrite_result: dict) -> dict:
+    """
+    Query Rewrite 결과를 분석하여 최적 검색 전략을 결정한다.
+
+    입력: rewrite_query()의 반환값
+      {original_query, rewritten_query, keywords, intent}
+
+    반환:
+      {
+        "query_type": "KEYWORD" | "SEMANTIC" | "MIXED" | "COMPLEX",
+        "strategy": {
+          "use_multi_step": bool,
+          "faiss_weight":   float,   # FAISS 가중치 (bm25_weight와 합 = 1.0)
+          "bm25_weight":    float,   # BM25 가중치
+          "rerank_weight":  float,   # Semantic Reranking 가중치
+          "top_k":          int,     # retrieve_places top_k
+          "diversity":      float,   # 샘플링 다양성 (0~1)
+        }
+      }
+    """
+    original  = rewrite_result.get("original_query", "")
+    rewritten = rewrite_result.get("rewritten_query", original)
+    keywords  = rewrite_result.get("keywords", [])
+
+    query_type = _classify_query_type(rewritten, keywords, original)
+    strategy   = dict(_STRATEGY_MAP[query_type])  # shallow copy — 원본 보호
+
+    print(
+        f"[query optimization]\n"
+        f"  query:    {original}\n"
+        f"  type:     {query_type}\n"
+        f"  strategy: {strategy}"
+    )
+
+    return {"query_type": query_type, "strategy": strategy}
+
+
 # ── Multi-step Retrieval ──────────────────────────────────────────────────────
 MULTI_STEP_SYSTEM_PROMPT = (
     "너는 복잡한 여행 요청을 여러 단계로 나누는 Query Planner다.\n\n"
@@ -1166,22 +1281,35 @@ def run_recommendation_pipeline(
         else personality
     )
 
-    # ✅ Multi-step Retrieval — 복잡한 쿼리는 하위 쿼리로 분해 후 병합
-    _status.info("🔍 **Hybrid 검색 중...** FAISS + BM25로 후보 장소를 추출하고 있습니다.")
-    decomposed    = decompose_query(search_query)
-    sub_queries   = decomposed["sub_queries"]
+    # ✅ Query Optimization — 쿼리 타입 분류 및 검색 전략 결정
+    opt      = optimize_query(rewrite)
+    strategy = opt["strategy"]
+
     retrieve_kwargs = dict(
-        region=region, top_k=15,
+        region=region,
+        top_k=strategy["top_k"],
         personality=search_personality,
         weather=weather, budget=budget, crowd=crowd,
         style=style_label,
         llm=get_llm(streaming=False),
         keywords=rewrite["keywords"],
+        faiss_weight=strategy["faiss_weight"],
+        bm25_weight=strategy["bm25_weight"],
+        rerank_weight=strategy["rerank_weight"],
+        diversity=strategy["diversity"],
     )
-    if len(sub_queries) > 1:
-        rag_result = multi_step_retrieve(vectorstore, sub_queries, **retrieve_kwargs)
+
+    # ✅ Multi-step Retrieval — COMPLEX형일 때만 분해 실행
+    _status.info("🔍 **Hybrid 검색 중...** FAISS + BM25로 후보 장소를 추출하고 있습니다.")
+    if strategy["use_multi_step"]:
+        decomposed  = decompose_query(search_query)
+        sub_queries = decomposed["sub_queries"]
+        if len(sub_queries) > 1:
+            rag_result = multi_step_retrieve(vectorstore, sub_queries, **retrieve_kwargs)
+        else:
+            rag_result = retrieve_places(vectorstore, sub_queries[0], **retrieve_kwargs)
     else:
-        rag_result = retrieve_places(vectorstore, sub_queries[0], **retrieve_kwargs)
+        rag_result = retrieve_places(vectorstore, search_query, **retrieve_kwargs)
     _bar.progress(33)
     _status.info("🎯 **의미 기반 재정렬 중...** 사용자 의도에 맞게 장소 순위를 조정하고 있습니다.")
     _bar.progress(40)
@@ -1820,11 +1948,13 @@ elif st.session_state.stage == 4:
                         personality=alt_p,
                         region=st.session_state.region,
                     )
-                    # ✅ Multi-step Retrieval — 다른 성향 추천에도 적용
-                    alt_decomposed  = decompose_query(rewrite["rewritten_query"])
-                    alt_sub_queries = alt_decomposed["sub_queries"]
+                    # ✅ Query Optimization — 다른 성향 추천에도 적용
+                    alt_opt      = optimize_query(rewrite)
+                    alt_strategy = alt_opt["strategy"]
+
                     alt_retrieve_kwargs = dict(
-                        region=st.session_state.region, top_k=15,
+                        region=st.session_state.region,
+                        top_k=alt_strategy["top_k"],
                         personality=alt_p,  # 버튼으로 선택한 성향 유지 (intent 무시)
                         weather=st.session_state.get("weather", "자동"),
                         budget=st.session_state.get("budget", "상관없음"),
@@ -1832,11 +1962,22 @@ elif st.session_state.stage == 4:
                         style=_style_label(float(st.session_state.get("travel_style", 0.5))),
                         llm=get_llm(streaming=False),
                         keywords=rewrite["keywords"],
+                        faiss_weight=alt_strategy["faiss_weight"],
+                        bm25_weight=alt_strategy["bm25_weight"],
+                        rerank_weight=alt_strategy["rerank_weight"],
+                        diversity=alt_strategy["diversity"],
                     )
-                    if len(alt_sub_queries) > 1:
-                        rag_result = multi_step_retrieve(vectorstore, alt_sub_queries, **alt_retrieve_kwargs)
+
+                    # ✅ Multi-step Retrieval — COMPLEX형일 때만 분해 실행
+                    if alt_strategy["use_multi_step"]:
+                        alt_decomposed  = decompose_query(rewrite["rewritten_query"])
+                        alt_sub_queries = alt_decomposed["sub_queries"]
+                        if len(alt_sub_queries) > 1:
+                            rag_result = multi_step_retrieve(vectorstore, alt_sub_queries, **alt_retrieve_kwargs)
+                        else:
+                            rag_result = retrieve_places(vectorstore, alt_sub_queries[0], **alt_retrieve_kwargs)
                     else:
-                        rag_result = retrieve_places(vectorstore, alt_sub_queries[0], **alt_retrieve_kwargs)
+                        rag_result = retrieve_places(vectorstore, rewrite["rewritten_query"], **alt_retrieve_kwargs)
                     retrieved      = rag_result["main_places"]
                     candidate_pool = rag_result["candidate_pool"]
                     st.session_state.retrieved_places = retrieved

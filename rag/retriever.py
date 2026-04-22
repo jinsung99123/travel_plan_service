@@ -5,10 +5,11 @@
 [Contextual Retrieval 개선]
   - Contextual Embedding : loader가 생성한 성향/지역/카테고리 컨텍스트 포함 page_content로 임베딩
   - Contextual BM25      : rank_bm25 기반 키워드 검색 (카테고리 + keywords + 설명 토큰화)
-  - Hybrid Search        : FAISS(0.6) + BM25(0.4) 정규화 점수 결합, 동일 문서 합산
+  - Hybrid Search        : faiss_weight * FAISS + bm25_weight * BM25 정규화 점수 결합
+                           Query Optimization이 쿼리 타입별 weight를 동적으로 조정
                            BM25에 rewrite keywords 추가 토큰으로 강화 가능
   - Metadata Score       : personality_tags·category 불일치 시 점수 penalty 적용
-  - Semantic Reranking   : LLM 기반 사용자 의도 적합도 재정렬 (base*0.7 + rerank*0.3)
+  - Semantic Reranking   : LLM 기반 사용자 의도 적합도 재정렬 (base*(1-rw) + rerank*rw)
 """
 
 import json
@@ -138,30 +139,33 @@ def hybrid_search(
     vectorstore: FAISS,
     query: str,
     top_n: int,
-    alpha: float = 0.6,
+    faiss_weight: float = 0.6,
+    bm25_weight: float = 0.4,
     bm25_extra_tokens: list[str] | None = None,
 ) -> list[tuple[dict, float]]:
     """
     FAISS + BM25 하이브리드 검색.
 
-    최종 점수 = alpha * normalized_embedding + (1-alpha) * normalized_bm25
-              = 0.6  * embedding_score       + 0.4       * bm25_score
+    최종 점수 = faiss_weight * normalized_faiss + bm25_weight * normalized_bm25
 
     처리 흐름:
       1. FAISS top_n 검색 → L2 → 유사도 변환 → min-max 정규화 (query 사용)
       2. BM25 top_n 검색 → min-max 정규화 (query + bm25_extra_tokens 사용)
-      3. id 기준 점수 합산 (FAISS에만 있는 문서: alpha 가중치만, BM25에만: (1-alpha)만)
+      3. id 기준 점수 합산 (FAISS에만 있는 문서: faiss_weight만, BM25에만: bm25_weight만)
       4. 최종 점수 내림차순 정렬
 
-    bm25_extra_tokens: Query Rewrite 에서 추출한 키워드를 BM25 쿼리에 추가로 반영.
-                       FAISS는 rewritten_query의 임베딩을 사용하고,
-                       BM25는 rewritten_query + extra_tokens 조합으로 키워드 검색 강화.
+    faiss_weight / bm25_weight: Query Optimization이 쿼리 타입별로 동적으로 조정.
+      - KEYWORD형  → bm25_weight ↑ (0.7), faiss_weight ↓ (0.3)
+      - SEMANTIC형 → faiss_weight ↑ (0.7), bm25_weight ↓ (0.3)
+      - MIXED형    → 균등 (0.5 / 0.5)
+      weight 합이 1이 아니어도 동작하나, Query Optimization은 합=1을 보장함.
+
+    bm25_extra_tokens: Query Rewrite에서 추출한 키워드를 BM25 쿼리에 추가로 반영.
     """
     bm25, corpus_metadata = build_bm25_index()
 
     faiss_normalized = _normalize_scores(_faiss_search(vectorstore, query, top_n))
 
-    # BM25 쿼리: 기본 쿼리 + rewrite 키워드 토큰 병합
     if bm25_extra_tokens:
         bm25_query = query + " " + " ".join(bm25_extra_tokens)
     else:
@@ -172,15 +176,15 @@ def hybrid_search(
 
     for meta, score in faiss_normalized:
         doc_id = meta.get("id")
-        combined[doc_id] = (meta, score * alpha)
+        combined[doc_id] = (meta, score * faiss_weight)
 
     for meta, score in bm25_normalized:
         doc_id = meta.get("id")
         if doc_id in combined:
             m, s = combined[doc_id]
-            combined[doc_id] = (m, s + score * (1 - alpha))
+            combined[doc_id] = (m, s + score * bm25_weight)
         else:
-            combined[doc_id] = (meta, score * (1 - alpha))
+            combined[doc_id] = (meta, score * bm25_weight)
 
     return sorted(combined.values(), key=lambda x: x[1], reverse=True)
 
@@ -450,18 +454,24 @@ def retrieve_places(
     style: str = "",
     llm: "ChatOpenAI | None" = None,
     keywords: list[str] | None = None,
+    faiss_weight: float = 0.6,
+    bm25_weight: float = 0.4,
+    rerank_weight: float = 0.3,
+    diversity: float = 0.3,
 ) -> dict:
     """
     Contextual Hybrid Retrieval — 검색 풀 확장 + 카테고리 다양성 + 대안 후보 반환.
 
     처리 흐름:
       1. hybrid_search()          — FAISS + BM25 결합 → top_k*6 후보 (풀 확장)
+                                    faiss_weight / bm25_weight: Query Optimization이 동적 조정
       2. _apply_metadata_score()  — personality_tags·category penalty
          _apply_extended_score()  — weather·budget·crowd·style bonus/penalty
       3. _region_match()          — 지역 필터 (fallback: 지역 무시)
       4. _cap_by_category()       — 카테고리당 최대 3개 제한
-      5. random.sample()          — 상위 풀에서 샘플링
-      ✅ rerank_places()          — LLM Semantic Reranking (llm 전달 시 활성화)
+      5. random.sample()          — diversity 기반 풀 크기 조정 후 샘플링
+                                    diversity 낮음 → 상위 점수 집중 / 높음 → 넓은 풀에서 다양 추출
+      ✅ rerank_places()          — LLM Semantic Reranking (rerank_weight 동적 적용)
       6. _group_by_dong()         — 동선 최적화
       7. candidate_pool           — 카테고리 cap 이후 전체 (대안 추천용)
 
@@ -471,11 +481,15 @@ def retrieve_places(
         "candidate_pool": list[dict],  # 대안 추천·재생성용 전체 후보
       }
     """
-    # 1. Hybrid 후보 검색 (풀 확장: top_k*6)
-    # FAISS: rewritten_query 임베딩 사용 / BM25: rewritten_query + keywords 병합으로 강화
-    candidates = hybrid_search(vectorstore, query, top_k * 6, bm25_extra_tokens=keywords or [])
+    # 1. Hybrid 후보 검색 (풀 확장: top_k*6) — 동적 weight 적용
+    candidates = hybrid_search(
+        vectorstore, query, top_k * 6,
+        faiss_weight=faiss_weight,
+        bm25_weight=bm25_weight,
+        bm25_extra_tokens=keywords or [],
+    )
 
-    # 2. 기존 scoring 로직 유지 (변경 없음)
+    # 2. Metadata·Extended scoring (기존 로직 유지)
     candidates = [
         (meta, _apply_extended_score(
             meta,
@@ -486,7 +500,6 @@ def retrieve_places(
     ]
     candidates.sort(key=lambda x: x[1], reverse=True)
 
-    # scoring 완료 시점의 점수 보존 — reranking 결합에 사용
     score_map: dict = {meta.get("id"): score for meta, score in candidates}
 
     # 3. 지역 필터
@@ -497,11 +510,12 @@ def retrieve_places(
     # 4. 카테고리 다양성 적용 (동일 카테고리 최대 3개)
     diversified = _cap_by_category(filtered, max_per_category=3)
 
-    # 5. 상위 풀에서 샘플링
-    pool_size = min(len(diversified), top_k * 2 + 5)
+    # 5. diversity 기반 샘플링 풀 조정
+    # diversity 0.2(낮음) → 풀 좁게(상위 점수 집중), 0.5(높음) → 풀 넓게(다양성 확보)
+    pool_size = min(len(diversified), max(top_k, int(top_k * 2 * (1.0 + diversity))))
     sampled = random.sample(diversified[:pool_size], min(top_k * 2, pool_size))
 
-    # ✅ Semantic Reranking — random.sample() 이후, _group_by_dong() 이전
+    # ✅ Semantic Reranking — rerank_weight 동적 적용
     if llm is not None:
         sampled = rerank_places(
             query=query,
@@ -513,6 +527,7 @@ def retrieve_places(
             budget=budget,
             crowd=crowd,
             style=style,
+            rerank_weight=rerank_weight,
         )
 
     # 6. 동선 최적화
