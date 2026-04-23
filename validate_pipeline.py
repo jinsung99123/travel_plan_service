@@ -10,7 +10,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 # ─── 데이터 로드 ─────────────────────────────────────────────────────────────
-from rag.loader import load_places, load_persona, build_place_documents
+from rag.loader import build_place_documents
 from rag.retriever import (
     build_bm25_index,
     _normalize_scores,
@@ -22,9 +22,7 @@ from rag.retriever import (
     _region_match,
 )
 
-places_df = load_places()
-persona_df = load_persona()
-docs = build_place_documents(places_df, persona_df)
+docs = build_place_documents()
 corpus_meta = [doc.metadata for doc in docs]
 _BM25_INDEX, _ = build_bm25_index()
 

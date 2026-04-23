@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from langchain_openai import ChatOpenAI
 
 from .indexer import get_or_build_vectorstore
-from .loader import load_places, load_persona, build_place_documents
+from .loader import build_place_documents
 
 
 # ── 벡터 스토어 ─────────────────────────────────────────────────────────────
@@ -77,9 +77,7 @@ def build_bm25_index() -> tuple:
     - Streamlit·스크립트 모두 동일 함수 사용 가능
     - 반환: (BM25Okapi, list[dict])  ← corpus_metadata 순서 = BM25 인덱스 순서
     """
-    places_df = load_places()
-    persona_df = load_persona()
-    docs = build_place_documents(places_df, persona_df)
+    docs = build_place_documents()
     corpus_metadata = [doc.metadata for doc in docs]
     tokenized_corpus = [_tokenize_for_bm25(m) for m in corpus_metadata]
     return BM25Okapi(tokenized_corpus), corpus_metadata
