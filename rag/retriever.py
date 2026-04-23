@@ -435,14 +435,13 @@ def rerank_places(
     budget: str = "",
     crowd: str = "",
     style: str = "",
-    rerank_weight: float = 0.3,
 ) -> list[dict]:
     """
-    LLM 기반 Semantic Reranking.
+    LLM 기반 Semantic Reranking — 미세 조정 역할만 수행.
 
     - candidates: random.sample() 이후의 metadata list (20~30개)
     - score_map:  {doc_id: base_score} — scoring 단계에서 보존된 원점수
-    - 최종 점수:  base_score * 0.7 + rerank_score * 0.3
+    - 최종 점수:  base_score * 0.8 + rerank_score_adjusted * 0.2
     - LLM 실패 시 기존 순서 유지 (fallback)
     - 동일 입력에 대한 결과는 모듈 레벨 dict로 캐싱
     """
@@ -480,20 +479,43 @@ def rerank_places(
             rerank_scores = {int(item["id"]): float(item["score"]) for item in parsed}
             _RERANK_CACHE[cache_key] = rerank_scores
         except Exception as exc:
-            print(f"[rerank] LLM 응답 파싱 실패: {exc} — 기존 점수 유지")
+            print(f"[rerank] LLM 응답 파싱 실패: {exc} — 기존 순서 유지")
             return candidates
 
-    # ── 점수 결합 ─────────────────────────────────────────────────────────────
-    base_weight = 1.0 - rerank_weight
+    # ── 점수 결합 (안정화: base_score 중심, rerank는 미세 조정) ───────────────
+    _BASE_W   = 0.8
+    _RERANK_W = 0.2
+    # rerank가 base를 이 값 이상 초과/하회하면 clamp
+    _MAX_DELTA = 0.5
+    _CLAMP_MARGIN = 0.2
+
     scored: list[tuple[dict, float]] = []
     for idx, meta in enumerate(candidates):
-        doc_id   = meta.get("id")
-        base     = score_map.get(doc_id, 0.5)
-        rerank   = rerank_scores.get(idx, 0.5)
-        final    = base * base_weight + rerank * rerank_weight
+        doc_id = meta.get("id")
+        base   = score_map.get(doc_id, 0.5)
+
+        # rerank_score 누락 시 base_score 그대로 사용 (fallback)
+        raw_rerank = rerank_scores.get(idx)
+        if raw_rerank is None:
+            rerank = base
+        else:
+            # [Step 1] rerank_score [0, 1] 범위 강제 clamp
+            rerank = max(0.0, min(1.0, float(raw_rerank)))
+
+            # [Step 2] 상승 clamp — LLM 과도 고점 방지
+            if rerank - base > _MAX_DELTA:
+                rerank = base + _CLAMP_MARGIN
+
+            # [Step 3] 하락 clamp — 좋은 후보의 급락 방지
+            if base - rerank > _MAX_DELTA:
+                rerank = base - _CLAMP_MARGIN
+
+        final = base * _BASE_W + rerank * _RERANK_W
+
         print(
-            f"[rerank log] id={doc_id} 장소={meta.get('장소명', '?')!s:<18} "
-            f"base_score={base:.4f}  rerank_score={rerank:.4f}  final_score={final:.4f}"
+            f"[rerank log] {meta.get('장소명', '?')!s:<18} | "
+            f"base={base:.2f} | rerank={rerank_scores.get(idx, base):.2f} | "
+            f"adjusted={rerank:.2f} | final={final:.2f}"
         )
         scored.append((meta, final))
 
@@ -516,7 +538,6 @@ def retrieve_places(
     keywords: list[str] | None = None,
     faiss_weight: float = 0.6,
     bm25_weight: float = 0.4,
-    rerank_weight: float = 0.3,
     diversity: float = 0.3,
 ) -> dict:
     """
@@ -531,7 +552,7 @@ def retrieve_places(
       4. _cap_by_category()       — 카테고리당 최대 3개 제한
       5. random.sample()          — diversity 기반 풀 크기 조정 후 샘플링
                                     diversity 낮음 → 상위 점수 집중 / 높음 → 넓은 풀에서 다양 추출
-      ✅ rerank_places()          — LLM Semantic Reranking (rerank_weight 동적 적용)
+      ✅ rerank_places()          — LLM Semantic Reranking (가중치 고정: base 0.8 / rerank 0.2)
       6. _group_by_dong()         — 동선 최적화
       7. candidate_pool           — 카테고리 cap 이후 전체 (대안 추천용)
 
@@ -583,7 +604,7 @@ def retrieve_places(
     pool_size = min(len(diversified), max(top_k, int(top_k * 2 * (1.0 + diversity))))
     sampled = random.sample(diversified[:pool_size], min(top_k * 2, pool_size))
 
-    # ✅ Semantic Reranking — rerank_weight 동적 적용
+    # ✅ Semantic Reranking
     if llm is not None:
         sampled = rerank_places(
             query=query,
@@ -595,7 +616,6 @@ def retrieve_places(
             budget=budget,
             crowd=crowd,
             style=style,
-            rerank_weight=rerank_weight,
         )
 
     # 6. 동선 최적화

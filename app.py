@@ -823,7 +823,6 @@ _STRATEGY_MAP: dict[str, dict] = {
         "use_multi_step": False,
         "faiss_weight":   0.3,
         "bm25_weight":    0.7,
-        "rerank_weight":  0.2,
         "top_k":          15,
         "diversity":      0.2,
     },
@@ -831,7 +830,6 @@ _STRATEGY_MAP: dict[str, dict] = {
         "use_multi_step": False,
         "faiss_weight":   0.7,
         "bm25_weight":    0.3,
-        "rerank_weight":  0.4,
         "top_k":          15,
         "diversity":      0.3,
     },
@@ -839,7 +837,6 @@ _STRATEGY_MAP: dict[str, dict] = {
         "use_multi_step": False,
         "faiss_weight":   0.5,
         "bm25_weight":    0.5,
-        "rerank_weight":  0.3,
         "top_k":          20,
         "diversity":      0.3,
     },
@@ -847,7 +844,6 @@ _STRATEGY_MAP: dict[str, dict] = {
         "use_multi_step": True,
         "faiss_weight":   0.5,
         "bm25_weight":    0.5,
-        "rerank_weight":  0.4,
         "top_k":          30,
         "diversity":      0.5,
     },
@@ -898,7 +894,6 @@ def optimize_query(rewrite_result: dict) -> dict:
           "use_multi_step": bool,
           "faiss_weight":   float,
           "bm25_weight":    float,
-          "rerank_weight":  float,
           "top_k":          int,
           "diversity":      float,
         }
@@ -929,22 +924,37 @@ def optimize_query(rewrite_result: dict) -> dict:
 
 
 # ── Multi-step Retrieval ──────────────────────────────────────────────────────
-MULTI_STEP_SYSTEM_PROMPT = (
-    "너는 복잡한 여행 요청을 여러 단계로 나누는 Query Planner다.\n\n"
-    "사용자의 요청을 분석하여:\n"
-    "1. 독립적인 검색이 가능한 하위 쿼리로 분해하라.\n"
-    "2. 각 쿼리는 명확한 장소 유형과 목적을 가져야 한다.\n\n"
-    "조건:\n"
-    "- 최대 3개 이하로 분해하라.\n"
-    "- 단순 쿼리(하나의 장소 유형만 포함)는 분해하지 말고 그대로 반환하라.\n"
-    "- 의미 중복 금지.\n"
-    "- 검색 가능한 형태로 작성하라.\n\n"
-    '출력은 JSON으로만: {"original_query": "...", "sub_queries": ["쿼리1", "쿼리2"]}'
+_DECOMPOSE_SYSTEM_MSG = SystemMessage(content=
+    "너는 여행 추천 시스템의 쿼리 분해 전문가다.\n\n"
+    "사용자의 복합 요청을 분석하여 검색에 적합한 sub-query를 생성하라.\n\n"
+    "[규칙]\n"
+    "1. 각 sub-query는 완전한 의미를 가진 자연어 문장이어야 한다\n"
+    "2. '목적' (데이트, 혼자, 가족 등)을 모든 sub-query에 유지해야 한다\n"
+    "3. '분위기/조건' (조용한, 감성적인, 여유로운 등)을 반영해야 한다\n"
+    "4. 단순 키워드 (카페, 공원)만 출력하지 말 것\n"
+    "5. 2~4개의 sub-query만 생성할 것\n"
+    "6. 공통 목적(purpose), 대표 분위기(mood), 카테고리 목록(categories)도 추출할 것\n"
+    "7. JSON 외 텍스트 금지. 마크다운 코드블록 금지.\n\n"
+    "출력 형식:\n"
+    '{"sub_queries": ["자연어 쿼리1", "자연어 쿼리2"],'
+    ' "purpose": "데이트|혼자|가족|친구|활동|힐링",'
+    ' "mood": "조용한|감성|활기찬|여유|힐링",'
+    ' "categories": ["카테고리1", "카테고리2"]}\n\n'
+    "입출력 예시:\n"
+    '입력: "데이트하면서 산책하고 카페 가고 싶어"\n'
+    '출력: {"sub_queries": ["데이트하기 좋은 조용한 산책 공원", "데이트하기 좋은 분위기 좋은 카페"],'
+    ' "purpose": "데이트", "mood": "조용한", "categories": ["공원", "카페"]}\n\n'
+    '입력: "혼자 여유롭게 쉬면서 커피 마시고 싶어"\n'
+    '출력: {"sub_queries": ["혼자 조용히 쉬기 좋은 공간", "혼자 가기 좋은 여유로운 카페"],'
+    ' "purpose": "혼자", "mood": "여유", "categories": ["공원", "카페"]}\n\n'
+    '입력: "가족과 함께 맛있는 거 먹고 공원도 가고 싶어"\n'
+    '출력: {"sub_queries": ["가족과 함께 가기 좋은 분위기 좋은 식당", "가족이 즐기기 좋은 넓은 공원 산책"],'
+    ' "purpose": "가족", "mood": "편안한", "categories": ["식당", "공원"]}'
 )
 
-_multi_step_prompt = ChatPromptTemplate.from_messages([
-    ("system", MULTI_STEP_SYSTEM_PROMPT),
-    ("human", "{user_input}"),
+_decompose_prompt = ChatPromptTemplate.from_messages([
+    _DECOMPOSE_SYSTEM_MSG,
+    ("human", '사용자 쿼리:\n"{user_query}"'),
 ])
 
 _DECOMPOSE_CACHE: dict[str, dict] = {}
@@ -954,59 +964,161 @@ def _decompose_cache_key(query: str) -> str:
     return hashlib.md5(query.encode()).hexdigest()
 
 
+# ── sub-query 품질 필터 / dedup / metadata 추출 ───────────────────────────────
+
+# 순수 카테고리 단어 단독 출력 방지
+_PURE_CATEGORY_WORDS: frozenset[str] = frozenset({
+    "카페", "공원", "맛집", "식당", "헬스", "볼링", "공연장", "커피",
+    "산책", "전시", "공연", "운동", "쇼핑", "박물관", "갤러리",
+})
+
+# 규칙 기반 fallback: 카테고리 키워드 → 의도 보존 자연어 쿼리
+_FALLBACK_TEMPLATES: dict[str, str] = {
+    "카페":   "방문하기 좋은 여유로운 카페",
+    "커피":   "커피 마시며 쉬기 좋은 카페",
+    "공원":   "산책하기 좋은 자연 공원",
+    "산책":   "산책하며 힐링하기 좋은 공원",
+    "맛집":   "분위기 좋은 음식점 맛집",
+    "식당":   "분위기 좋은 식사 공간",
+    "헬스":   "운동하기 좋은 헬스 피트니스 시설",
+    "볼링":   "즐기기 좋은 볼링장",
+    "공연장": "감상하기 좋은 공연 문화시설",
+    "전시":   "전시 관람하기 좋은 문화시설",
+}
+
+# 카테고리 힌트 토큰 → category 이름 (per-sub-query 키워드 추출용)
+_SQ_CATEGORY_HINTS: dict[str, str] = {
+    "카페": "카페", "커피": "카페", "디저트": "카페",
+    "공원": "공원", "산책": "공원", "자연": "공원",
+    "맛집": "식당", "식당": "식당", "음식": "식당", "식사": "식당",
+    "헬스": "헬스", "운동": "헬스", "피트니스": "헬스",
+    "볼링": "볼링", "공연": "공연장", "전시": "공연장", "문화": "공연장",
+}
+
+
+def _is_quality_subquery(q: str) -> bool:
+    """토큰 수 < 5이거나 순수 카테고리 단어 단독 출력이면 False."""
+    stripped = q.strip()
+    if stripped in _PURE_CATEGORY_WORDS:
+        return False
+    return len(stripped.split()) >= 5
+
+
+def _dedup_subqueries(queries: list[str]) -> list[str]:
+    """
+    핵심 토큰 자카드 유사도 ≥ 0.6이면 중복으로 판단하여 뒤쪽 제거.
+    의미가 다른 쿼리("조용한 카페" vs "분위기 좋은 카페")는 둘 다 유지.
+    """
+    result: list[str] = []
+    for q in queries:
+        q_tok = set(q.split())
+        is_dup = any(
+            len(q_tok & set(e.split())) / max(min(len(q_tok), len(set(e.split()))), 1) >= 0.6
+            for e in result
+        )
+        if not is_dup:
+            result.append(q)
+    return result
+
+
+def _extract_sq_category(q: str) -> list[str]:
+    """sub-query 텍스트에서 BM25 부스팅용 카테고리 키워드를 추출한다."""
+    seen: set[str] = set()
+    cats: list[str] = []
+    for token, cat in _SQ_CATEGORY_HINTS.items():
+        if token in q and cat not in seen:
+            seen.add(cat)
+            cats.append(cat)
+    return cats
+
+
+def _fallback_decompose(query: str) -> list[str]:
+    """
+    LLM 실패 시 규칙 기반 분해.
+    쿼리에서 카테고리 키워드를 찾아 의도 보존 자연어 쿼리로 변환한다.
+    """
+    found: list[str] = []
+    for kw, template in _FALLBACK_TEMPLATES.items():
+        if kw in query and template not in found:
+            found.append(template)
+    return found[:3] if found else [query]
+
+
 def decompose_query(query: str) -> dict:
     """
-    복잡한 쿼리를 독립적인 하위 쿼리로 분해한다.
+    복잡한 쿼리를 의미 보존형 하위 쿼리로 분해한다.
 
     반환:
       {
         "original_query": 원본 쿼리,
-        "sub_queries":    하위 쿼리 리스트 (단순 쿼리면 [query] 그대로),
+        "sub_queries":    의도 보존 자연어 쿼리 리스트 (품질 필터·dedup 적용),
+        "metadata":       {"purpose": str, "mood": str, "categories": list[str]},
       }
-    LLM 실패 시 fallback: {"original_query": query, "sub_queries": [query]}
+    LLM 실패 시 규칙 기반 fallback.
     동일 입력은 모듈 레벨 dict로 캐싱.
     """
     cache_key = _decompose_cache_key(query)
     if cache_key in _DECOMPOSE_CACHE:
         return _DECOMPOSE_CACHE[cache_key]
 
-    fallback = {"original_query": query, "sub_queries": [query]}
+    _empty_meta = {"purpose": "", "mood": "", "categories": []}
+
+    def _build_result(sqs: list[str], meta: dict) -> dict:
+        return {"original_query": query, "sub_queries": sqs, "metadata": meta}
 
     try:
         api_key = st.secrets.get("OPENAI_API_KEY", "")
         if not api_key:
-            return fallback
+            return _build_result(_fallback_decompose(query), _empty_meta)
 
         llm = ChatOpenAI(model="gpt-4o", temperature=0.0, openai_api_key=api_key)
-        chain = _multi_step_prompt | llm | StrOutputParser()
-        raw = chain.invoke({"user_input": query}).strip()
+        chain = _decompose_prompt | llm | StrOutputParser()
+        raw = chain.invoke({"user_query": query}).strip()
 
         if raw.startswith("```"):
             raw = re.sub(r"```[a-z]*\n?", "", raw).strip("` \n")
 
         parsed = json.loads(raw)
-        sub_queries = [str(q) for q in parsed.get("sub_queries", [query])]
-        sub_queries = sub_queries[:3]  # 최대 3개 제한
-        if not sub_queries:
-            sub_queries = [query]
 
-        result = {
-            "original_query": str(parsed.get("original_query", query)),
-            "sub_queries":    sub_queries,
+        # ── sub-query 추출 및 품질 필터 ──────────────────────────────────────
+        raw_sqs = [str(q) for q in parsed.get("sub_queries", [])][:4]
+        filtered = [q for q in raw_sqs if _is_quality_subquery(q)]
+
+        # 품질 필터 후 빈 리스트면 규칙 기반 fallback
+        if not filtered:
+            filtered = _fallback_decompose(query)
+
+        # ── dedup ─────────────────────────────────────────────────────────────
+        deduped = _dedup_subqueries(filtered)
+        if not deduped:
+            deduped = [query]
+
+        # ── metadata 추출 ─────────────────────────────────────────────────────
+        meta = {
+            "purpose":    str(parsed.get("purpose", "")),
+            "mood":       str(parsed.get("mood", "")),
+            "categories": [str(c) for c in parsed.get("categories", [])],
         }
 
+        # ── 로그 ─────────────────────────────────────────────────────────────
+        sq_lines = "\n".join(f"  {i+1}. {q}" for i, q in enumerate(deduped))
         print(
-            f"[multi-step]\n"
-            f"  original:    {result['original_query']}\n"
-            f"  sub_queries: {result['sub_queries']}"
+            f"[Multi-step log]\n"
+            f"원본 쿼리:\n  \"{query}\"\n"
+            f"생성된 sub-query:\n{sq_lines}\n"
+            f"추출된 metadata:\n"
+            f"  - purpose: {meta['purpose']}\n"
+            f"  - mood:    {meta['mood']}\n"
+            f"  - categories: {meta['categories']}"
         )
 
+        result = _build_result(deduped, meta)
         _DECOMPOSE_CACHE[cache_key] = result
         return result
 
     except Exception as exc:
-        print(f"[multi-step] 분해 실패: {exc} — 원본 쿼리 유지")
-        return fallback
+        print(f"[Multi-step] 분해 실패: {exc} — 규칙 기반 fallback 적용")
+        return _build_result(_fallback_decompose(query), _empty_meta)
 
 
 def multi_step_retrieve(
@@ -1021,9 +1133,15 @@ def multi_step_retrieve(
     llm=None,
     keywords: list[str] | None = None,
     top_k: int = 15,
+    sub_query_metas: list[dict] | None = None,
 ) -> dict:
     """
     sub_queries 각각에 대해 retrieve_places()를 호출하고 결과를 병합한다.
+
+    sub_query_metas: decompose_query()가 반환한 per-sub-query 메타데이터 리스트.
+      각 항목에 "categories" 키가 있으면 해당 sub-query의 BM25 keywords로 사용.
+      없으면 _extract_sq_category(sq)로 규칙 기반 추출.
+      전역 keywords가 명시된 경우 그것을 우선한다.
 
     병합 전략:
     - main_places: id 기준 중복 제거, 먼저 나온 순서(max-score first-seen) 유지
@@ -1033,13 +1151,21 @@ def multi_step_retrieve(
     merged_main: list[dict] = []
     merged_pool: list[dict] = []
 
-    for sq in sub_queries:
+    for i, sq in enumerate(sub_queries):
+        # per-sub-query keywords: 전역 keywords 우선, 없으면 메타 or 규칙 추출
+        if keywords:
+            sq_keywords = keywords
+        elif sub_query_metas and i < len(sub_query_metas):
+            sq_keywords = sub_query_metas[i].get("categories") or _extract_sq_category(sq)
+        else:
+            sq_keywords = _extract_sq_category(sq)
+
         result = retrieve_places(
             vectorstore, sq, region, top_k=top_k,
             personality=personality,
             weather=weather, budget=budget, crowd=crowd,
             style=style, llm=llm,
-            keywords=keywords,
+            keywords=sq_keywords,
         )
         main = result.get("main_places", [])
         pool = result.get("candidate_pool", [])
@@ -1391,7 +1517,6 @@ def run_recommendation_pipeline(
         keywords=rewrite["keywords"],
         faiss_weight=strategy["faiss_weight"],
         bm25_weight=strategy["bm25_weight"],
-        rerank_weight=strategy["rerank_weight"],
         diversity=strategy["diversity"],
     )
 
@@ -2060,14 +2185,13 @@ elif st.session_state.stage == 4:
                         keywords=rewrite["keywords"],
                         faiss_weight=alt_strategy["faiss_weight"],
                         bm25_weight=alt_strategy["bm25_weight"],
-                        rerank_weight=alt_strategy["rerank_weight"],
                         diversity=alt_strategy["diversity"],
                     )
 
                     # ✅ Multi-step Retrieval — COMPLEX형일 때만 분해 실행
                     if alt_strategy["use_multi_step"]:
-                        alt_decomposed  = decompose_query(rewrite["rewritten_query"])
-                        alt_sub_queries = alt_decomposed["sub_queries"]
+                        # rewrite_query()가 이미 분해한 sub_queries 재사용 (LLM 재호출 없음)
+                        alt_sub_queries = rewrite.get("sub_queries") or [rewrite["rewritten_query"]]
                         if len(alt_sub_queries) > 1:
                             rag_result = multi_step_retrieve(vectorstore, alt_sub_queries, **alt_retrieve_kwargs)
                         else:
