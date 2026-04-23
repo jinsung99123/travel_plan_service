@@ -150,7 +150,9 @@ def hybrid_search(
 
     처리 흐름:
       1. FAISS top_n 검색 → L2 → 유사도 변환 → min-max 정규화 (query 사용)
-      2. BM25 top_n 검색 → min-max 정규화 (query + bm25_extra_tokens 사용)
+      2. BM25 top_n 검색 → 전체 score=0 여부 확인 후 min-max 정규화
+         - max_score=0 이면 effective_bm25_weight=0 으로 BM25 기여 완전 차단
+           (정규화 시 모든 score→1.0 되는 노이즈 방지)
       3. id 기준 점수 합산 (FAISS에만 있는 문서: faiss_weight만, BM25에만: bm25_weight만)
       4. 최종 점수 내림차순 정렬
 
@@ -166,11 +168,17 @@ def hybrid_search(
 
     faiss_normalized = _normalize_scores(_faiss_search(vectorstore, query, top_n))
 
-    if bm25_extra_tokens:
-        bm25_query = query + " " + " ".join(bm25_extra_tokens)
-    else:
-        bm25_query = query
-    bm25_normalized = _normalize_scores(_bm25_search(bm25, corpus_metadata, bm25_query, top_n))
+    bm25_query = query + (" " + " ".join(bm25_extra_tokens) if bm25_extra_tokens else "")
+    bm25_raw = _bm25_search(bm25, corpus_metadata, bm25_query, top_n)
+
+    # BM25 score=0 방어: max=0이면 정규화 시 전체→1.0이 되어 랜덤 노이즈로 작동
+    max_bm25 = max((s for _, s in bm25_raw), default=0.0)
+    effective_bm25_weight = bm25_weight
+    if max_bm25 == 0.0:
+        print(f"[hybrid] BM25 전체 score=0 (쿼리: '{bm25_query}') → bm25_weight 0으로 차단")
+        effective_bm25_weight = 0.0
+
+    bm25_normalized = _normalize_scores(bm25_raw) if effective_bm25_weight > 0 else []
 
     combined: dict[int, tuple[dict, float]] = {}
 
@@ -182,11 +190,57 @@ def hybrid_search(
         doc_id = meta.get("id")
         if doc_id in combined:
             m, s = combined[doc_id]
-            combined[doc_id] = (m, s + score * bm25_weight)
+            combined[doc_id] = (m, s + score * effective_bm25_weight)
         else:
-            combined[doc_id] = (meta, score * bm25_weight)
+            combined[doc_id] = (meta, score * effective_bm25_weight)
 
     return sorted(combined.values(), key=lambda x: x[1], reverse=True)
+
+
+# ── 카테고리 힌트 기반 점수 조정 ─────────────────────────────────────────────
+_QUERY_CATEGORY_MAP: dict[str, frozenset] = {
+    '카페':   frozenset({'카페', '디저트카페', '고양이카페'}),
+    '커피':   frozenset({'카페', '디저트카페', '고양이카페'}),
+    '공원':   frozenset({'공원'}),
+    '산책':   frozenset({'공원'}),
+    '헬스':   frozenset({'헬스', '스포츠', '피트니스', '체육관', '스포츠센터'}),
+    '볼링':   frozenset({'볼링'}),
+    '테니스': frozenset({'테니스'}),
+    '문화':   frozenset({'공연장', '문화시설', '문화센터', '테마거리', '전통'}),
+    '전시':   frozenset({'공연장', '문화시설', '문화센터'}),
+    '식당':   frozenset({'육류', '한식', '해산물', '두부', '닭요리', '냉면', '일식',
+                        '갈비', '해물', '베트남', '샤브샤브', '삼계탕', '보쌈',
+                        '돈까스', '초밥', '치킨', '참치', '조개', '장어',
+                        '칼국수', '떡볶이', '태국', '중식', '이탈리안', '양식'}),
+    '맛집':   frozenset({'육류', '한식', '해산물', '두부', '닭요리', '냉면', '일식',
+                        '갈비', '해물', '베트남', '샤브샤브', '삼계탕', '보쌈',
+                        '돈까스', '초밥', '치킨', '참치', '조개', '장어',
+                        '칼국수', '떡볶이', '태국', '중식', '이탈리안', '양식'}),
+}
+_CATEGORY_HINT_PENALTY = 0.70
+
+
+def _apply_category_hint_score(
+    meta: dict,
+    score: float,
+    query: str,
+    keywords: list[str] | None = None,
+) -> float:
+    """
+    쿼리 또는 keywords에 명시적 카테고리 힌트(카페, 공원 등)가 있을 때,
+    불일치 카테고리 문서에 soft penalty 적용 (hard filter 아님).
+
+    예: "조용한 카페" 검색 시 공원·헬스장 → ×0.70
+    """
+    text = query + " " + " ".join(keywords or [])
+    hinted: set[str] = set()
+    for hint, cats in _QUERY_CATEGORY_MAP.items():
+        if hint in text:
+            hinted |= cats
+
+    if hinted and meta.get("카테고리") not in hinted:
+        score *= _CATEGORY_HINT_PENALTY
+    return score
 
 
 # ── 메타데이터 기반 점수 조정 ────────────────────────────────────────────────
@@ -199,6 +253,7 @@ def _apply_metadata_score(meta: dict, score: float, personality: str) -> float:
     """
     성향·카테고리 불일치 시 점수 감소 (hard filter 대신 soft penalty).
 
+    - is_general=True (구 균형형): 모든 성향에 패널티 없이 적용
     - personality_tags에 요청 성향 없음 → × 0.85  (15% 감점)
     - 액티비티형 + 비허용 카테고리     → 추가 × 0.70  (최대 40% 감점)
 
@@ -207,6 +262,11 @@ def _apply_metadata_score(meta: dict, score: float, personality: str) -> float:
     """
     if not personality:
         return score
+
+    # 범용 장소(구 균형형)는 어떤 성향에도 패널티 없이 적합
+    if meta.get("is_general"):
+        return score
+
     p_tags = meta.get("personality_tags", [])
     if p_tags and personality not in p_tags:
         score *= 0.85
@@ -489,11 +549,19 @@ def retrieve_places(
         bm25_extra_tokens=keywords or [],
     )
 
-    # 2. Metadata·Extended scoring (기존 로직 유지)
+    # 2. Metadata·Extended scoring
+    # _apply_metadata_score  : personality_tags·activity category penalty
+    # _apply_category_hint_score: 쿼리 카테고리 힌트 불일치 penalty (신규)
+    # _apply_extended_score  : weather·budget·crowd·style bonus/penalty
     candidates = [
         (meta, _apply_extended_score(
             meta,
-            _apply_metadata_score(meta, score, personality),
+            _apply_category_hint_score(
+                meta,
+                _apply_metadata_score(meta, score, personality),
+                query=query,
+                keywords=keywords,
+            ),
             weather=weather, budget=budget, crowd=crowd, style=style,
         ))
         for meta, score in candidates

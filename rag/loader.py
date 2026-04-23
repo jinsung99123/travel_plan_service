@@ -63,6 +63,9 @@ def map_personality_tags(keywords_str: str, persona_df: pd.DataFrame) -> list[st
     """
     장소 키워드 ∩ 성향 키워드 교집합으로 매칭 성향 태그를 반환한다.
     "카페,감성,여유" → ["힐링형"]
+
+    "균형형"은 여기서 그대로 반환되며, build_place_documents()에서
+    is_general 필드로 분리된 후 personality_tags에서 제거된다.
     """
     place_kws = {k.strip() for k in keywords_str.split(",")}
     tags: list[str] = []
@@ -101,12 +104,20 @@ def build_place_documents(
         kw_str = str(row["키워드"])
         address = str(row["주소"])
         region_info = extract_region(address)
-        p_tags = map_personality_tags(kw_str, persona_df)
+        raw_tags = map_personality_tags(kw_str, persona_df)
+
+        # ── 균형형 → is_general 분리 ──────────────────────────────────────
+        # 균형형은 97%+ 장소에 붙어 임베딩에서 노이즈가 됨.
+        # personality_tags에서 제거하고 is_general 필드로 분리해 변별력 복원.
+        is_general = "균형형" in raw_tags
+        p_tags = [t for t in raw_tags if t != "균형형"]
 
         # ── Contextual page_content (임베딩 대상) ─────────────────────────
-        # 성향 컨텍스트: 매칭 성향이 있으면 앞에 명시, 없으면 일반 여행자
+        # 성향 컨텍스트: 특정 성향이 있으면 앞에 명시, 범용이면 "모든 성향"으로 표현
         if p_tags:
             persona_ctx = f"[{', '.join(p_tags)}] 성향 여행자가"
+        elif is_general:
+            persona_ctx = "모든 성향 여행자가"
         else:
             persona_ctx = "여행자가"
 
@@ -141,7 +152,8 @@ def build_place_documents(
             "sido":             region_info["sido"],
             "sigungu":          region_info["sigungu"],
             "dong":             region_info["dong"],
-            "personality_tags": p_tags,
+            "personality_tags": p_tags,      # 균형형 제거 후 실제 성향만
+            "is_general":       is_general,  # 균형형 여부 (범용 장소 플래그)
             # ── 확장 메타데이터 (places_extended.csv) ───────────────────────
             "stay_time":        str(row.get("stay_time", "")),
             "crowd_level":      str(row.get("crowd_level", "")),
