@@ -5,6 +5,7 @@ import uuid
 import streamlit as st
 from datetime import date, datetime, timedelta
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -620,27 +621,76 @@ def _style_label(travel_style: float) -> str:
     return "보통"
 
 
-# ── Query Rewrite ─────────────────────────────────────────────────────────────
-REWRITE_SYSTEM_PROMPT = (
-    "너는 여행 추천 시스템의 검색 성능을 향상시키는 Query Rewriter다.\n\n"
-    "사용자의 자연어 요청을 분석하여:\n"
-    "1. 검색에 유리한 키워드를 추출하고\n"
-    "2. 의미를 명확히 하고\n"
-    "3. 검색 최적화된 문장으로 재작성하라.\n\n"
-    "Rewrite 규칙:\n"
-    "- 장소 유형(카페, 음식점, 공원 등), 분위기(조용한, 감성, 활기찬 등), "
-    "활동(산책, 사진, 데이트 등) 키워드를 추출하라.\n"
-    "- '좀', '약간', '괜찮은', '느낌' 등 검색에 불필요한 표현을 제거하라.\n"
-    "- '쉬고 싶다' → '조용한 카페 힐링 공간' 처럼 구체적 장소·활동으로 의미를 확장하라.\n"
-    "- 성향은 다음 중 하나로만 추론하라: 힐링형, 액티비티형, 탐방형, 미식형, 감성형, 균형형\n\n"
-    "출력은 반드시 아래 JSON 형식만 반환하라. 다른 텍스트 출력 금지.\n"
-    '{"original_query": "원본 쿼리", "rewritten_query": "검색 최적화 문장", '
-    '"keywords": ["키워드1", "키워드2"], "intent": "성향명"}'
+# ── Query Rewrite + Intent Parser ────────────────────────────────────────────
+_REWRITE_SYSTEM_MSG = SystemMessage(content=
+    "너는 RAG 기반 여행 추천 시스템의 Query Rewrite + Intent Parser이다.\n\n"
+    "사용자의 자연어 요청을 분석하여 아래 5단계를 순서대로 수행하고,\n"
+    "결과를 단일 JSON으로만 출력하라. 다른 텍스트 출력 금지.\n\n"
+
+    "【STEP 1】 query_type 분류\n"
+    "  KEYWORD  : 명사형 단어 나열, 토큰 ≤3, 키워드 ≤2  (예: '노원 카페')\n"
+    "  SEMANTIC : 추상적·감성적 자연어, 장소 카테고리 미포함 (예: '혼자 쉬고 싶어')\n"
+    "  MIXED    : 카테고리 키워드 + 자연어 혼합 (예: '조용한 카페에서 책 읽고 싶어')\n"
+    "  COMPLEX  : '도 하고', '그리고', '뿐만 아니라', '면서' 등 복합 연결 패턴 포함\n\n"
+
+    "【STEP 2】 rewritten_query 생성\n"
+    "  - FAISS 임베딩 검색에 유리한 자연어 문장으로 재작성하라.\n"
+    "  - 장소 유형(카페, 음식점, 공원 등), 분위기(조용한, 감성, 활기찬 등),\n"
+    "    활동(산책, 사진, 데이트 등) 키워드를 포함하라.\n"
+    "  - '좀', '약간', '괜찮은', '느낌' 등 검색에 불필요한 표현을 제거하라.\n"
+    "  - '쉬고 싶다' → '조용한 카페 힐링 휴식 공간'처럼 구체적 장소·활동으로 확장하라.\n"
+    "  - COMPLEX형은 전체를 아우르는 통합 검색 문장 1개를 생성하라.\n\n"
+
+    "【STEP 3】 filters 추출\n"
+    "  아래 필드를 추출하라. 언급 없으면 null 또는 빈 리스트.\n"
+    "  - category    : 장소 유형 (카페, 음식점, 공원, 헬스, 볼링, 공연장 등) — 리스트\n"
+    "  - purpose     : 목적/동반 유형 (데이트, 혼자, 친구, 가족, 활동, 힐링) — 리스트\n"
+    "  - weather     : 날씨 언급 시 (맑음, 흐림, 비, 눈) — null 또는 문자열\n"
+    "  - indoor_outdoor : 실내/실외 명시 시 (실내, 실외, 실내외) — null 또는 문자열\n"
+    "  - crowd       : 혼잡도 언급 시 (높음, 보통, 낮음) — null 또는 문자열\n"
+    "  - budget      : 예산 언급 시 (고가, 중가, 저가) — null 또는 문자열\n"
+    "  - style       : 분위기/스타일 (조용한, 감성, 활기찬, 힐링, 여유) — null 또는 문자열\n\n"
+
+    "【STEP 4】 sub_queries 생성 (COMPLEX 전용)\n"
+    "  - 독립 검색 가능한 하위 쿼리 최대 3개로 분해하라.\n"
+    "  - 의미 중복 금지, 각 쿼리는 장소 유형과 목적이 명확해야 한다.\n"
+    "  - COMPLEX가 아니면 빈 리스트 []를 반환하라.\n\n"
+
+    "【STEP 5】 출력 제약\n"
+    "  - JSON 외 텍스트 금지. 마크다운 코드블록 금지.\n"
+    "  - 모든 문자열 값은 한국어.\n\n"
+
+    "출력 형식:\n"
+    '{"original_query": "원본 쿼리",'
+    ' "rewritten_query": "검색 최적화 문장",'
+    ' "query_type": "KEYWORD|SEMANTIC|MIXED|COMPLEX",'
+    ' "filters": {"category": [], "purpose": [], "weather": null,'
+    ' "indoor_outdoor": null, "crowd": null, "budget": null, "style": null},'
+    ' "sub_queries": []}\n\n'
+
+    "입출력 예시:\n"
+    '입력: "노원 카페"\n'
+    '출력: {"original_query": "노원 카페", "rewritten_query": "노원구 카페 조용한 분위기",'
+    ' "query_type": "KEYWORD", "filters": {"category": ["카페"], "purpose": [],'
+    ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": null, "style": null},'
+    ' "sub_queries": []}\n\n'
+    '입력: "혼자 조용히 쉬고 싶어"\n'
+    '출력: {"original_query": "혼자 조용히 쉬고 싶어",'
+    ' "rewritten_query": "혼자 조용한 카페 힐링 여유 휴식 공간",'
+    ' "query_type": "SEMANTIC", "filters": {"category": [], "purpose": ["혼자", "힐링"],'
+    ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": null, "style": "조용한"},'
+    ' "sub_queries": []}\n\n'
+    '입력: "카페에서 커피 마시고 공원도 산책하고 싶어"\n'
+    '출력: {"original_query": "카페에서 커피 마시고 공원도 산책하고 싶어",'
+    ' "rewritten_query": "카페 커피 공원 산책 힐링 여유",'
+    ' "query_type": "COMPLEX", "filters": {"category": ["카페", "공원"], "purpose": ["힐링"],'
+    ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": null, "style": null},'
+    ' "sub_queries": ["조용한 카페 커피 여유", "공원 산책 자연 힐링"]}'
 )
 
 _rewrite_prompt = ChatPromptTemplate.from_messages([
-    ("system", REWRITE_SYSTEM_PROMPT),
-    ("human", "{user_input}"),
+    _REWRITE_SYSTEM_MSG,
+    ("human", '사용자 쿼리:\n"{user_query}"'),
 ])
 
 # 모듈 레벨 캐시: {md5_key: result_dict}
@@ -658,14 +708,16 @@ def rewrite_query(
     region: str = "",
 ) -> dict:
     """
-    사용자 쿼리를 검색 최적화 형태로 재작성한다.
+    사용자 쿼리를 검색 최적화 형태로 재작성하고 의도를 파싱한다.
 
     반환:
       {
         "original_query":  원본 쿼리,
         "rewritten_query": 검색 최적화 문장 (FAISS 임베딩 입력),
-        "keywords":        추출 키워드 리스트 (BM25 추가 토큰),
-        "intent":          추론 성향,
+        "query_type":      "KEYWORD" | "SEMANTIC" | "MIXED" | "COMPLEX",
+        "filters":         {category, purpose, weather, indoor_outdoor, crowd, budget, style},
+        "sub_queries":     COMPLEX형 하위 쿼리 리스트 (그 외 []),
+        "keywords":        filters["category"] 기반 BM25 추가 토큰 (하위 호환),
       }
     LLM 실패 또는 API 키 없음 시 원본 쿼리 그대로 반환 (fallback).
     동일 입력은 모듈 레벨 dict로 캐싱하여 LLM 재호출 방지.
@@ -674,11 +726,17 @@ def rewrite_query(
     if cache_key in _REWRITE_CACHE:
         return _REWRITE_CACHE[cache_key]
 
+    _empty_filters = {
+        "category": [], "purpose": [], "weather": None,
+        "indoor_outdoor": None, "crowd": None, "budget": None, "style": None,
+    }
     fallback = {
         "original_query":  user_input,
         "rewritten_query": user_input,
+        "query_type":      "SEMANTIC",
+        "filters":         _empty_filters,
+        "sub_queries":     [],
         "keywords":        [],
-        "intent":          personality,
     }
 
     try:
@@ -692,25 +750,52 @@ def rewrite_query(
             openai_api_key=api_key,
         )
         chain = _rewrite_prompt | llm | StrOutputParser()
-        raw = chain.invoke({"user_input": user_input}).strip()
+        raw = chain.invoke({"user_query": user_input}).strip()
 
         if raw.startswith("```"):
             raw = re.sub(r"```[a-z]*\n?", "", raw).strip("` \n")
 
         parsed = json.loads(raw)
+
+        filters = parsed.get("filters", {})
+        if not isinstance(filters, dict):
+            filters = {}
+        # 각 필드 타입 보정
+        filters = {
+            "category":       [str(c) for c in filters.get("category", [])],
+            "purpose":        [str(p) for p in filters.get("purpose", [])],
+            "weather":        filters.get("weather") or None,
+            "indoor_outdoor": filters.get("indoor_outdoor") or None,
+            "crowd":          filters.get("crowd") or None,
+            "budget":         filters.get("budget") or None,
+            "style":          filters.get("style") or None,
+        }
+
+        valid_types = {"KEYWORD", "SEMANTIC", "MIXED", "COMPLEX"}
+        query_type = parsed.get("query_type", "SEMANTIC")
+        if query_type not in valid_types:
+            query_type = "SEMANTIC"
+
+        sub_queries = [str(q) for q in parsed.get("sub_queries", [])][:3]
+        if query_type == "COMPLEX" and not sub_queries:
+            sub_queries = [user_input]
+
         result = {
             "original_query":  str(parsed.get("original_query", user_input)),
             "rewritten_query": str(parsed.get("rewritten_query", user_input)),
-            "keywords":        [str(k) for k in parsed.get("keywords", [])],
-            "intent":          str(parsed.get("intent", personality)),
+            "query_type":      query_type,
+            "filters":         filters,
+            "sub_queries":     sub_queries,
+            "keywords":        filters["category"],  # BM25 하위 호환
         }
 
         print(
             f"[query rewrite]\n"
-            f"  input:     {result['original_query']}\n"
-            f"  rewritten: {result['rewritten_query']}\n"
-            f"  keywords:  {result['keywords']}\n"
-            f"  intent:    {result['intent']}"
+            f"  input:      {result['original_query']}\n"
+            f"  rewritten:  {result['rewritten_query']}\n"
+            f"  type:       {result['query_type']}\n"
+            f"  filters:    {result['filters']}\n"
+            f"  sub_queries:{result['sub_queries']}"
         )
 
         _REWRITE_CACHE[cache_key] = result
@@ -804,27 +889,34 @@ def optimize_query(rewrite_result: dict) -> dict:
     Query Rewrite 결과를 분석하여 최적 검색 전략을 결정한다.
 
     입력: rewrite_query()의 반환값
-      {original_query, rewritten_query, keywords, intent}
+      {original_query, rewritten_query, query_type, filters, sub_queries, keywords}
 
     반환:
       {
         "query_type": "KEYWORD" | "SEMANTIC" | "MIXED" | "COMPLEX",
         "strategy": {
           "use_multi_step": bool,
-          "faiss_weight":   float,   # FAISS 가중치 (bm25_weight와 합 = 1.0)
-          "bm25_weight":    float,   # BM25 가중치
-          "rerank_weight":  float,   # Semantic Reranking 가중치
-          "top_k":          int,     # retrieve_places top_k
-          "diversity":      float,   # 샘플링 다양성 (0~1)
+          "faiss_weight":   float,
+          "bm25_weight":    float,
+          "rerank_weight":  float,
+          "top_k":          int,
+          "diversity":      float,
         }
       }
     """
     original  = rewrite_result.get("original_query", "")
     rewritten = rewrite_result.get("rewritten_query", original)
-    keywords  = rewrite_result.get("keywords", [])
 
-    query_type = _classify_query_type(rewritten, keywords, original)
-    strategy   = dict(_STRATEGY_MAP[query_type])  # shallow copy — 원본 보호
+    # LLM이 분류한 query_type 우선 사용, 없거나 유효하지 않으면 규칙 기반 fallback
+    llm_type = rewrite_result.get("query_type", "")
+    valid_types = {"KEYWORD", "SEMANTIC", "MIXED", "COMPLEX"}
+    if llm_type in valid_types:
+        query_type = llm_type
+    else:
+        keywords   = rewrite_result.get("keywords", [])
+        query_type = _classify_query_type(rewritten, keywords, original)
+
+    strategy = dict(_STRATEGY_MAP[query_type])  # shallow copy — 원본 보호
 
     print(
         f"[query optimization]\n"
@@ -1273,22 +1365,26 @@ def run_recommendation_pipeline(
     # ✅ Query Rewrite — retrieve_places 호출 직전
     _status.info("✏️ **쿼리 최적화 중...** 검색 성능 향상을 위해 쿼리를 재작성하고 있습니다.")
     _bar.progress(27)
-    rewrite = rewrite_query(query, personality=personality, region=region)
-    search_query       = rewrite["rewritten_query"]
-    search_personality = (
-        rewrite["intent"]
-        if rewrite["intent"] in PERSONALITY_TYPES
-        else personality
-    )
+    rewrite      = rewrite_query(query, personality=personality, region=region)
+    search_query = rewrite["rewritten_query"]
+    filters      = rewrite.get("filters", {})
 
-    # ✅ Query Optimization — 쿼리 타입 분류 및 검색 전략 결정
+    # filters에서 UI 미입력 필드 보완 (사용자가 입력하지 않은 경우에만)
+    if not weather and filters.get("weather"):
+        weather = filters["weather"]
+    if not budget and filters.get("budget"):
+        budget = filters["budget"]
+    if not crowd and filters.get("crowd"):
+        crowd = filters["crowd"]
+
+    # ✅ Query Optimization — LLM 분류 query_type 기반 검색 전략 결정
     opt      = optimize_query(rewrite)
     strategy = opt["strategy"]
 
     retrieve_kwargs = dict(
         region=region,
         top_k=strategy["top_k"],
-        personality=search_personality,
+        personality=personality,
         weather=weather, budget=budget, crowd=crowd,
         style=style_label,
         llm=get_llm(streaming=False),
@@ -1302,8 +1398,8 @@ def run_recommendation_pipeline(
     # ✅ Multi-step Retrieval — COMPLEX형일 때만 분해 실행
     _status.info("🔍 **Hybrid 검색 중...** FAISS + BM25로 후보 장소를 추출하고 있습니다.")
     if strategy["use_multi_step"]:
-        decomposed  = decompose_query(search_query)
-        sub_queries = decomposed["sub_queries"]
+        # rewrite_query()가 이미 분해한 sub_queries 재사용 (LLM 재호출 없음)
+        sub_queries = rewrite.get("sub_queries") or [search_query]
         if len(sub_queries) > 1:
             rag_result = multi_step_retrieve(vectorstore, sub_queries, **retrieve_kwargs)
         else:
