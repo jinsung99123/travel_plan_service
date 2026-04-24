@@ -2,11 +2,12 @@
 places_extended.csv + persona.csv → data/places_enriched.json
 
 생성 항목:
-  - purpose: 장소별 동적 추론 (카테고리 고정값 금지)
-  - mood:    키워드 + crowd 기반 동적 추론 (fallback "편안한" 금지)
-  - page_content: FAISS용 자연어 문장 (데이트/혼자/비/실내 등 반드시 포함)
-  - plain_text:   BM25용 키워드 열거 텍스트
-  - metadata:     retriever.py 호환 전체 필드 (personality_tags, is_general 포함)
+  - purpose: 장소별 동적 추론 (카테고리+가격+crowd 기반, 카테고리 고정값 금지)
+  - mood:    키워드 + crowd + price 기반 동적 추론 (편안한 금지)
+              어휘: 조용한 / 활기찬 / 감성적인 / 힐링되는 / 가성비 / 특별한
+  - page_content: FAISS용 자연어 문장 (vocabulary 원형 보존)
+  - plain_text:   BM25용 키-값 구조 텍스트 (확장 토큰 포함)
+  - metadata:     retriever.py 호환 전체 필드 (personality_tags, is_general, is_visual_spot)
 """
 
 import csv, json, re, sys
@@ -44,26 +45,27 @@ def extract_region(address: str) -> str:
 
 
 # ── 카테고리 분류 상수 ────────────────────────────────────────────────────────
-_ACTIVITY_CATS   = {"헬스", "볼링", "스포츠", "체육관", "테니스", "당구장", "스포츠센터", "댄스"}
-_FOOD_CATS       = {
+_ACTIVITY_CATS = {"헬스", "볼링", "스포츠", "체육관", "테니스", "당구장", "스포츠센터", "댄스"}
+_FOOD_CATS     = {
     "냉면", "육류", "한식", "갈비", "돈까스", "샤브샤브", "해산물", "두부",
     "닭요리", "일식", "해물", "양식", "베트남", "삼계탕", "보쌈", "초밥",
     "치킨", "참치", "조개", "칼국수", "태국", "중식", "떡볶이", "장어", "이탈리안", "분식",
 }
-_CAFE_CATS       = {"카페", "디저트카페", "고양이카페"}
-_PARK_CATS       = {"공원", "테마거리"}
-_CULTURAL_CATS   = {"공연장", "문화시설", "문화센터", "전시", "갤러리", "박물관"}
+_CAFE_CATS     = {"카페", "디저트카페", "고양이카페"}
+_PARK_CATS     = {"공원", "테마거리"}
+_CULTURAL_CATS = {"공연장", "문화시설", "문화센터", "전시", "갤러리", "박물관"}
 
 
 # ── purpose 동적 생성 ──────────────────────────────────────────────────────────
 def infer_purpose(row: dict, kw_set: set) -> list[str]:
     cat   = row["카테고리"]
     crowd = row["crowd_level"]
+    price = row.get("price_level", "중가")
     pool: set[str] = set()
 
     # 카테고리 방향성
-    if cat in _ACTIVITY_CATS or kw_set & {"스포츠", "건강", "활동", "체험"}:
-        pool |= {"친구", "활동"}
+    if cat in _ACTIVITY_CATS or kw_set & {"운동", "체험", "스포츠", "건강"}:
+        pool.add("활동")
 
     if cat in _PARK_CATS or kw_set & {"산책", "자연", "힐링"}:
         pool |= {"데이트", "힐링"}
@@ -77,16 +79,24 @@ def infer_purpose(row: dict, kw_set: set) -> list[str]:
             pool.add("혼자")
 
     if cat in _FOOD_CATS:
-        pool.add("친구" if crowd != "낮음" else "혼자")
+        if price == "고가":
+            pool |= {"데이트", "가족"}
+        elif price == "저가":
+            pool |= {"친구", "혼자"}
+        else:  # 중가
+            pool.add("혼자" if crowd == "낮음" else "친구")
 
     # 키워드 기반 추론
-    if kw_set & {"SNS", "감성", "사진", "핫플"}:
+    if kw_set & {"SNS", "감성", "사진"}:
+        pool.add("데이트")
+
+    if kw_set & {"핫플"}:
         pool |= {"데이트", "친구"}
 
     if kw_set & {"가족"}:
         pool.add("가족")
 
-    if kw_set & {"가성비", "맛집", "음식"}:
+    if kw_set & {"가성비", "맛집"}:
         pool |= {"친구", "혼자"}
 
     # crowd 보정
@@ -100,7 +110,6 @@ def infer_purpose(row: dict, kw_set: set) -> list[str]:
         pool.add("혼자" if crowd == "낮음" else "친구")
 
     # 우선순위 정렬 후 최대 3개
-    # "가족" 키워드가 명시된 장소는 가족 목적을 반드시 포함 (순위와 무관)
     order = ["데이트", "친구", "혼자", "힐링", "활동", "가족"]
     ranked = [p for p in order if p in pool]
     if "가족" in kw_set and "가족" not in ranked[:3]:
@@ -109,201 +118,182 @@ def infer_purpose(row: dict, kw_set: set) -> list[str]:
 
 
 # ── mood 동적 생성 ─────────────────────────────────────────────────────────────
+# 어휘: 조용한 / 활기찬 / 감성적인 / 힐링되는 / 가성비 / 특별한
 def infer_mood(row: dict, kw_set: set) -> list[str]:
     cat   = row["카테고리"]
     crowd = row["crowd_level"]
+    price = row.get("price_level", "중가")
     pool: set[str] = set()
 
     if kw_set & {"SNS", "감성", "사진", "핫플", "거리", "문화", "전통", "전시"}:
-        pool.add("감성")
+        pool.add("감성적인")
 
-    if kw_set & {"산책", "자연", "힐링", "여유"}:
-        pool.add("힐링")
+    if kw_set & {"산책", "자연", "힐링", "여유"} or cat in _PARK_CATS:
+        pool.add("힐링되는")
 
     if crowd == "낮음" or kw_set & {"여유", "조용"}:
-        pool.add("조용")
+        pool.add("조용한")
 
     if crowd == "높음" or kw_set & {"핫플", "활동", "활기", "거리"}:
-        pool.add("활기")
+        pool.add("활기찬")
+
+    if cat in _FOOD_CATS and price == "저가":
+        pool.add("가성비")
+
+    if cat in _FOOD_CATS and price == "고가":
+        pool.add("특별한")
 
     # fallback (카테고리 기반, "편안한" 금지)
     if not pool:
         if cat in _ACTIVITY_CATS:
-            pool.add("활기")
+            pool.add("활기찬")
         elif cat in _PARK_CATS:
-            pool.add("힐링")
+            pool.add("힐링되는")
         elif cat in _FOOD_CATS:
-            pool.add("활기" if crowd == "높음" else "조용")
+            pool.add("활기찬" if crowd == "높음" else "조용한")
         else:
-            pool.add("감성" if crowd != "낮음" else "조용")
+            pool.add("감성적인" if crowd != "낮음" else "조용한")
 
-    order = ["감성", "활기", "힐링", "조용"]
+    order = ["조용한", "활기찬", "감성적인", "힐링되는", "가성비", "특별한"]
     return [m for m in order if m in pool][:2]
 
 
 # ── 텍스트 매핑 상수 ──────────────────────────────────────────────────────────
-_CROWD_LABEL = {"낮음": "한산", "보통": "보통", "높음": "혼잡"}
-_CROWD_DESC  = {
-    "낮음": "한산하여 조용하게 이용할 수 있다",
-    "보통": "적당한 사람들이 있어 편안한 분위기다",
-    "높음": "사람이 많아 활기찬 분위기다",
+_CROWD_DESC = {
+    "낮음": "혼잡도가 낮아 여유롭게 머무를 수 있다",
+    "보통": "적당한 사람들과 편안한 분위기를 즐길 수 있다",
+    "높음": "활기차고 사람들로 북적이는 분위기다",
 }
-_INDOOR_LABEL = {"실내": "실내 공간", "실외": "실외 공간", "혼합": "실내외 모두 이용 가능한 공간"}
-_INDOOR_SENT  = {
-    "실내": "실내 공간으로 날씨의 영향을 받지 않는다",
-    "실외": "실외 공간으로 탁 트인 환경을 즐길 수 있다",
-    "혼합": "실내외를 모두 이용할 수 있다",
+
+_WEATHER_INDOOR_SENT = {
+    ("비",       "실내"): "비 오는 날에도 방문하기 좋은 실내 공간이며",
+    ("비",       "혼합"): "비 오는 날에는 실내 공간을 중심으로 이용하면 좋으며",
+    ("비",       "실외"): "비 오는 날에는 야외 공간 이용에 주의가 필요하며",
+    ("더위",     "실내"): "더운 날씨에 시원하게 즐길 수 있는 실내 공간이며",
+    ("더위",     "실외"): "더운 날씨에도 탁 트인 실외에서 즐길 수 있으며",
+    ("더위",     "혼합"): "더운 날씨에 실내외를 모두 이용할 수 있으며",
+    ("추위",     "실내"): "추운 날씨에도 따뜻하게 이용할 수 있는 실내 공간이며",
+    ("추위",     "실외"): "추운 날씨에도 신선한 실외 공간을 즐길 수 있으며",
+    ("추위",     "혼합"): "추운 날씨에 실내외를 모두 이용할 수 있으며",
+    ("모든 날씨", "실내"): "날씨에 관계없이 언제든 방문할 수 있는 실내 공간이며",
+    ("모든 날씨", "실외"): "날씨에 관계없이 탁 트인 실외에서 즐길 수 있으며",
+    ("모든 날씨", "혼합"): "날씨에 관계없이 실내외를 모두 이용할 수 있으며",
 }
-_WEATHER_SENT = {
-    "비":      "비 오는 날에도 방문하기 좋다",
-    "더위":    "더운 날씨에 시원하게 즐길 수 있다",
-    "추위":    "추운 날씨에도 따뜻하게 이용할 수 있다",
-    "모든 날씨": "날씨에 관계없이 언제든 방문할 수 있다",
+
+_PURPOSE_LABEL = {
+    "데이트": "데이트",
+    "혼자":  "혼자",
+    "친구":  "친구",
+    "힐링":  "힐링",
+    "활동":  "활동",
+    "가족":  "가족",
 }
-_PRICE_LABEL = {"저가": "저렴한 편", "중가": "적당한 가격", "고가": "가격대가 높은 편"}
 
 
-# ── page_content 생성 (FAISS용) ───────────────────────────────────────────────
+# ── page_content 생성 (FAISS용 자연어 문장) ──────────────────────────────────
 def build_page_content(row: dict, purpose: list[str], mood: list[str], region: str) -> str:
-    name       = row["장소명"]
-    cat        = row["카테고리"]
-    desc       = row["설명"]
-    crowd      = row["crowd_level"]
-    indoor     = row["indoor_outdoor"]
-    weather    = row["weather_fit"]
-    stay       = row["stay_time"]
-    best_time  = row["best_time"]
-    price      = row["price_level"]
+    cat     = row["카테고리"]
+    desc    = row["설명"]
+    crowd   = row["crowd_level"]
+    indoor  = row["indoor_outdoor"]
+    weather = row["weather_fit"]
 
-    purpose_str = ", ".join(purpose)
-    mood_str    = ", ".join(mood)
-
-    # 혼자/데이트/친구 가능 여부 문장 (핵심 vocabulary 강제 포함)
-    usage: list[str] = []
-    if "혼자" in purpose:
-        usage.append("혼자 방문하기 좋다")
-    if "데이트" in purpose:
-        usage.append("데이트 코스로 적합하다")
-    if "친구" in purpose:
-        usage.append("친구와 함께 즐기기 좋다")
-    if "가족" in purpose:
-        usage.append("가족 단위 방문에도 좋다")
-    if "힐링" in purpose:
-        usage.append("힐링이 필요할 때 찾기 좋은 곳이다")
-    if "활동" in purpose:
-        usage.append("활동적인 여가를 즐기기 좋다")
-    usage_sentence = " ".join(usage) + "."
-
-    # 날씨 + 실내외 조합 문장 (핵심 vocabulary 강제 포함)
-    if weather == "비" and indoor == "실내":
-        weather_indoor = "비 오는 날에도 실내에서 편안하게 이용할 수 있다."
-    elif weather == "비" and indoor == "실외":
-        weather_indoor = "비가 올 경우 야외 공간 이용에 주의가 필요하다."
-    elif weather == "비" and indoor == "혼합":
-        weather_indoor = "비 오는 날에는 실내 공간을 중심으로 이용하면 좋다."
-    elif indoor == "실내":
-        weather_indoor = f"{_WEATHER_SENT.get(weather, weather)} 실내 공간으로 쾌적하다."
-    elif indoor == "실외":
-        weather_indoor = f"{_WEATHER_SENT.get(weather, weather)} 실외 공간이라 자연을 가까이 느낄 수 있다."
+    # 목적 문구
+    p_labels = [_PURPOSE_LABEL.get(p, p) for p in purpose]
+    if len(p_labels) == 1:
+        purpose_phrase = f"{p_labels[0]} 방문하기 좋은"
+    elif len(p_labels) == 2:
+        purpose_phrase = f"{p_labels[0]}나 {p_labels[1]} 방문하기 좋은"
     else:
-        weather_indoor = f"{_WEATHER_SENT.get(weather, weather)} {_INDOOR_SENT.get(indoor, '')}."
+        purpose_phrase = ", ".join(p_labels) + " 방문하기 좋은"
+
+    # 분위기 문구 — 원형 그대로 붙여 vocabulary 매칭 보장
+    mood_phrase = " ".join(mood)  # e.g., "조용한 감성적인"
+
+    # 문장 1: 목적 + 분위기 + 지역 + 카테고리
+    sent1 = f"{purpose_phrase} {mood_phrase} 분위기의 {region} {cat}."
+
+    # 날씨+실내외 문구
+    weather_indoor = _WEATHER_INDOOR_SENT.get(
+        (weather, indoor),
+        f"{indoor} 공간이며",
+    )
+
+    # 혼잡도 문구
+    crowd_desc = _CROWD_DESC.get(crowd, "")
+
+    # 최종 조합: "목적+분위기+카테고리. 날씨+실내, 혼잡도. 설명."
+    return f"{sent1} {weather_indoor}, {crowd_desc}. {desc}"
+
+
+# ── plain_text 생성 (BM25용 키-값 구조) ──────────────────────────────────────
+def build_plain_text(
+    row: dict, purpose: list[str], mood: list[str], region: str, kw_set: set
+) -> str:
+    name    = row["장소명"]
+    cat     = row["카테고리"]
+    desc    = row["설명"]
+    crowd   = row["crowd_level"]
+    indoor  = row["indoor_outdoor"]
+    weather = row["weather_fit"]
+    price   = row["price_level"]
+
+    # 날씨 확장 토큰 (BM25 쿼리 다양성 대응)
+    weather_tokens = weather
+    if weather == "비":
+        weather_tokens = "비 우천 비오는날"
+    elif weather == "더위":
+        weather_tokens = "더위 여름 시원"
+    elif weather == "추위":
+        weather_tokens = "추위 겨울 따뜻"
+
+    # 실내외 확장 토큰
+    indoor_tokens = indoor
+    if indoor == "혼합":
+        indoor_tokens = "실내 실외 혼합"
+
+    # 혼잡도 확장 토큰
+    crowd_tokens = crowd
+    if crowd == "낮음":
+        crowd_tokens = "낮음 조용한 한산"
+    elif crowd == "높음":
+        crowd_tokens = "높음 활기찬 혼잡"
+
+    kw_str = " ".join(sorted(kw_set))
 
     lines = [
-        f"{purpose_str}에 어울리는 {region}의 {cat}.",
-        "",
         f"장소명: {name}",
-        f"추천 상황: {purpose_str}",
-        f"분위기: {mood_str}",
-        f"설명: {desc} {usage_sentence}",
-        f"혼잡도: {_CROWD_LABEL.get(crowd, crowd)} ({_CROWD_DESC.get(crowd, '')})",
-        f"실내외: {_INDOOR_LABEL.get(indoor, indoor)}",
-        f"날씨: {weather_indoor}",
-        f"방문 시간대: {best_time} | 체류 시간: {stay}분 | 가격대: {_PRICE_LABEL.get(price, price)}",
+        f"카테고리: {cat}",
+        f"추천 상황: {', '.join(purpose)}",
+        f"분위기: {', '.join(mood)}",
+        f"날씨: {weather_tokens}",
+        f"실내외: {indoor_tokens}",
+        f"혼잡도: {crowd_tokens}",
+        f"가격대: {price}",
+        f"설명: {desc}",
+        f"키워드: {kw_str}",
         f"지역: {region}",
     ]
     return "\n".join(lines)
 
 
-# ── plain_text 생성 (BM25용) ──────────────────────────────────────────────────
-def build_plain_text(
-    row: dict, purpose: list[str], mood: list[str], region: str, kw_set: set
-) -> str:
-    name      = row["장소명"]
-    cat       = row["카테고리"]
-    desc      = row["설명"]
-    crowd     = row["crowd_level"]
-    indoor    = row["indoor_outdoor"]
-    weather   = row["weather_fit"]
-    stay      = row["stay_time"]
-    price     = row["price_level"]
-    best_time = row["best_time"]
-
-    # 확장 키워드: weather / indoor / crowd 어휘 명시적 추가
-    extended: list[str] = list(kw_set)
-
-    if crowd == "낮음":
-        extended += ["조용", "한산"]
-    elif crowd == "높음":
-        extended += ["활기", "혼잡"]
-
-    if indoor == "실내":
-        extended.append("실내")
-    elif indoor == "실외":
-        extended.append("실외")
-    elif indoor == "혼합":
-        extended += ["실내", "실외"]
-
-    if weather == "비":
-        extended += ["비", "우천", "비오는날"]
-    elif weather == "더위":
-        extended += ["더위", "여름", "시원"]
-    elif weather == "추위":
-        extended += ["추위", "겨울", "따뜻"]
-
-    extended += purpose
-    extended += mood
-
-    # 순서 보존 중복 제거
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for tok in extended:
-        if tok not in seen:
-            seen.add(tok)
-            deduped.append(tok)
-
-    kw_combined = " ".join(deduped)
-
-    tokens = [
-        f"장소명 {name}",
-        f"카테고리 {cat}",
-        f"추천상황 {' '.join(purpose)}",
-        f"분위기 {' '.join(mood)}",
-        f"키워드 {kw_combined}",
-        f"설명 {desc}",
-        f"날씨 {weather}",
-        f"실내외 {indoor}",
-        f"가격 {price}",
-        f"혼잡도 {crowd}",
-        f"체류시간 {stay}",
-        f"방문시간 {best_time}",
-        f"지역 {region}",
-    ]
-    return " ".join(tokens)
-
-
 # ── persona.csv 기반 personality_tags 매핑 ───────────────────────────────────
-def map_personality_tags(kw_set: set, persona_rows: list[dict]) -> tuple[list[str], bool]:
+def map_personality_tags(kw_set: set, persona_rows: list[dict]) -> tuple[list[str], bool, bool]:
     """
     장소 키워드 ∩ 성향 키워드 교집합으로 personality_tags 산출.
-    균형형은 is_general 플래그로 분리하여 personality_tags에서 제거.
+    균형형 → is_general 플래그 (personality_tags에서 제거).
+    감성형 → is_visual_spot 플래그 (SNS/사진/감성 키워드 보유 시).
+    personality_tags 최대 2개.
     """
     raw: list[str] = []
     for p in persona_rows:
         p_kws = {k.strip() for k in f"{p['핵심키워드']},{p['보조키워드']}".split(",")}
         if kw_set & p_kws:
             raw.append(p["성향"])
-    is_general = "균형형" in raw
-    return [t for t in raw if t != "균형형"], is_general
+    is_general     = "균형형" in raw
+    is_visual_spot = bool(kw_set & {"SNS", "사진", "감성"})
+    tags = [t for t in raw if t not in ("균형형", "감성형")][:2]
+    return tags, is_general, is_visual_spot
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
@@ -324,7 +314,7 @@ def main() -> None:
 
         purpose = infer_purpose(row, kw_set)
         mood    = infer_mood(row, kw_set)
-        personality_tags, is_general = map_personality_tags(kw_set, persona_rows)
+        personality_tags, is_general, is_visual_spot = map_personality_tags(kw_set, persona_rows)
 
         results.append({
             # ── 검색 텍스트 ──────────────────────────────────────────────────
@@ -354,6 +344,7 @@ def main() -> None:
                 # 성향 태그
                 "personality_tags": personality_tags,
                 "is_general":       is_general,
+                "is_visual_spot":   is_visual_spot,
                 # extended 필드
                 "stay_time":      row.get("stay_time", ""),
                 "crowd_level":    row.get("crowd_level", ""),
@@ -377,13 +368,17 @@ def main() -> None:
     all_pc = " ".join(r["page_content"] for r in results)
     all_pt = " ".join(r["plain_text"]   for r in results)
 
-    check_words = ["데이트", "혼자", "친구", "가족", "조용", "감성", "활기", "힐링", "비", "실내", "실외"]
+    check_words = [
+        "데이트", "혼자", "친구", "가족",
+        "조용한", "감성적인", "활기찬", "힐링되는",
+        "비", "실내", "실외",
+    ]
     print("── vocabulary coverage ──────────────────────")
     for w in check_words:
         pc = all_pc.count(w)
         pt = all_pt.count(w)
         status = "✅" if pc >= 5 and pt >= 5 else "⚠️ "
-        print(f"  {status} {w:6s}: page_content={pc:3d}회  plain_text={pt:3d}회")
+        print(f"  {status} {w:8s}: page_content={pc:3d}회  plain_text={pt:3d}회")
 
     print("\n── purpose 분포 ──────────────────────────────")
     all_purposes = [p for r in results for p in r["purpose"]]
@@ -395,7 +390,7 @@ def main() -> None:
     all_moods = [m for r in results for m in r["mood"]]
     for m, cnt in Counter(all_moods).most_common():
         bar = "█" * (cnt // 2)
-        print(f"  {m:6s}: {cnt:3d}건  {bar}")
+        print(f"  {m:8s}: {cnt:3d}건  {bar}")
 
     # 샘플 출력 (카페 1개, 공원 1개, 식당 1개)
     print("\n── 샘플 출력 ─────────────────────────────────")
@@ -410,8 +405,8 @@ def main() -> None:
             print("  page_content:")
             for line in r["page_content"].split("\n"):
                 print(f"    {line}")
-            print(f"  plain_text (앞 200자):")
-            print(f"    {r['plain_text'][:200]}")
+            print(f"  plain_text (앞 300자):")
+            print(f"    {r['plain_text'][:300]}")
 
 
 if __name__ == "__main__":

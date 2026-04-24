@@ -52,13 +52,17 @@ def build_vectorstore_standalone(api_key: str) -> FAISS:
 def _tokenize_for_bm25(metadata: dict) -> list[str]:
     """
     BM25 문서 토큰화 전략:
-    카테고리 + keywords(list) + 설명 → 공백·쉼표 분리 토큰
-    page_content(contextual)가 아닌 원본 필드 사용 → 키워드 검색 정확도 유지
+    카테고리 + keywords + 설명 + plain_text → 공백·쉼표 분리 토큰
+
+    plain_text: build_enriched_places.py가 purpose/mood/weather/indoor 어휘를
+    BM25용으로 명시적으로 열거한 필드 → "데이트", "혼자", "비" 같은 purpose 쿼리가
+    BM25 코퍼스에 매칭되어 Hybrid 기여 가능 (없으면 BM25 GUARD 발동)
     """
-    category = metadata.get("카테고리", "")
-    keywords = metadata.get("keywords", [])   # 이미 list[str]
+    category    = metadata.get("카테고리", "")
+    keywords    = metadata.get("keywords", [])
     description = metadata.get("설명", "")
-    text = f"{category} {' '.join(keywords)} {description}"
+    plain_text  = metadata.get("plain_text", "")
+    text = f"{category} {' '.join(keywords)} {description} {plain_text}"
     return [t for t in re.split(r"[\s,，.。]+", text) if t]
 
 
