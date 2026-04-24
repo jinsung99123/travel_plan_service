@@ -94,16 +94,40 @@ def _normalize_scores(
     """
     Min-max 정규화 → [0, 1] 범위로 통일.
     FAISS(L2 변환값)와 BM25(자연수 범위) 점수를 동일 스케일로 결합하기 위해 필요.
-    모든 점수가 동일하면 1.0으로 통일.
+
+    Edge cases — 1.0 대신 0.5(neutral) 반환:
+    - 항목 1개 : 정규화 의미 없음
+    - 분산=0   : 전체 1.0이 되어 BM25 GUARD 우회 후 랜덤 노이즈 증폭 가능
     """
     if not items:
         return items
     scores = [s for _, s in items]
+    if len(scores) <= 1:
+        return [(m, 0.5) for m, _ in items]
     min_s, max_s = min(scores), max(scores)
-    rng = max_s - min_s
-    if rng == 0:
-        return [(m, 1.0) for m, _ in items]
-    return [(m, (s - min_s) / rng) for m, s in items]
+    if max_s - min_s < 1e-6:
+        return [(m, 0.5) for m, _ in items]
+    return [(m, (s - min_s) / (max_s - min_s)) for m, s in items]
+
+
+# ── Weight 동적 보정 ─────────────────────────────────────────────────────────
+def adjust_weights(
+    query_type: str,
+    weather: str,
+    indoor_outdoor: str,
+    base_faiss: float,
+    base_bm25: float,
+) -> tuple[float, float]:
+    """
+    SEMANTIC + weather/indoor_outdoor 필터 동시 존재 시 weight를 0.5/0.5로 보정.
+
+    "비 오는 날 실내에서" 같은 SEMANTIC 쿼리는 weather/indoor 키워드가
+    BM25 plain_text에 명시되어 있어 BM25도 충분히 활용 가능한 상황.
+    FAISS 단독 의존(0.7/0.3)보다 50/50이 더 정확하다.
+    """
+    if query_type == "SEMANTIC" and (bool(weather) or bool(indoor_outdoor)):
+        return 0.5, 0.5
+    return base_faiss, base_bm25
 
 
 # ── 개별 검색 ───────────────────────────────────────────────────────────────
@@ -275,6 +299,45 @@ def _apply_metadata_score(meta: dict, score: float, personality: str) -> float:
     if personality == "액티비티형" and meta.get("카테고리") not in _ACTIVITY_ALLOWED:
         score *= 0.70
     return score
+
+
+# ── Visual Spot 점수 조정 ────────────────────────────────────────────────────
+_VISUAL_BLOCK_CATS = {
+    "헬스", "볼링", "스포츠", "피트니스", "체육관", "테니스",
+    "당구장", "스포츠센터", "댄스",
+}
+_VISUAL_BLOCK_PURPOSES = {"활동", "헬스", "운동"}
+
+
+def _apply_visual_score(
+    meta: dict,
+    score: float,
+    visual_intent: bool,
+    query_type: str,
+    filter_purposes: list[str],
+) -> float:
+    """
+    visual_intent=True 쿼리에서 is_visual_spot 플래그로 boost/penalty 적용.
+
+    적용 제외 조건:
+    - visual_intent=False  : 감성/사진 의도 없음 → skip
+    - query_type=KEYWORD   : 키워드 검색은 의미 부스트 불필요
+    - filter_purposes에 활동/헬스/운동 포함 : 스포츠 맥락 → skip
+    - 카테고리가 스포츠/헬스 계열 : visual 맥락과 무관 → skip
+
+    배수:
+    - is_visual_spot=True  → ×1.10 (최대 +10%)
+    - is_visual_spot=False → ×0.95 (-5% 패널티)
+    """
+    if not visual_intent:
+        return score
+    if query_type == "KEYWORD":
+        return score
+    if set(filter_purposes) & _VISUAL_BLOCK_PURPOSES:
+        return score
+    if meta.get("카테고리") in _VISUAL_BLOCK_CATS:
+        return score
+    return score * (1.10 if meta.get("is_visual_spot") else 0.95)
 
 
 # ── 확장 메타데이터 점수 조정 ────────────────────────────────────────────────
@@ -541,6 +604,10 @@ def retrieve_places(
     faiss_weight: float = 0.6,
     bm25_weight: float = 0.4,
     diversity: float = 0.3,
+    query_type: str = "",
+    indoor_outdoor: str = "",
+    visual_intent: bool = False,
+    filter_purposes: list[str] | None = None,
 ) -> dict:
     """
     Contextual Hybrid Retrieval — 검색 풀 확장 + 카테고리 다양성 + 대안 후보 반환.
@@ -565,6 +632,9 @@ def retrieve_places(
       }
     """
     # 1. Hybrid 후보 검색 (풀 확장: top_k*6) — 동적 weight 적용
+    faiss_weight, bm25_weight = adjust_weights(
+        query_type, weather, indoor_outdoor, faiss_weight, bm25_weight
+    )
     candidates = hybrid_search(
         vectorstore, query, top_k * 6,
         faiss_weight=faiss_weight,
@@ -577,15 +647,21 @@ def retrieve_places(
     # _apply_category_hint_score: 쿼리 카테고리 힌트 불일치 penalty (신규)
     # _apply_extended_score  : weather·budget·crowd·style bonus/penalty
     candidates = [
-        (meta, _apply_extended_score(
+        (meta, _apply_visual_score(
             meta,
-            _apply_category_hint_score(
+            _apply_extended_score(
                 meta,
-                _apply_metadata_score(meta, score, personality),
-                query=query,
-                keywords=keywords,
+                _apply_category_hint_score(
+                    meta,
+                    _apply_metadata_score(meta, score, personality),
+                    query=query,
+                    keywords=keywords,
+                ),
+                weather=weather, budget=budget, crowd=crowd, style=style,
             ),
-            weather=weather, budget=budget, crowd=crowd, style=style,
+            visual_intent=visual_intent,
+            query_type=query_type,
+            filter_purposes=filter_purposes or [],
         ))
         for meta, score in candidates
     ]

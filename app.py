@@ -649,7 +649,11 @@ _REWRITE_SYSTEM_MSG = SystemMessage(content=
     "  - indoor_outdoor : 실내/실외 명시 시 (실내, 실외, 실내외) — null 또는 문자열\n"
     "  - crowd       : 혼잡도 언급 시 (높음, 보통, 낮음) — null 또는 문자열\n"
     "  - budget      : 예산 언급 시 (고가, 중가, 저가) — null 또는 문자열\n"
-    "  - style       : 분위기/스타일 (조용한, 감성, 활기찬, 힐링, 여유) — null 또는 문자열\n\n"
+    "      · 저렴한, 싸게, 가성비, 알뜰 → \"저가\"\n"
+    "      · 비싼, 고급, 프리미엄, 럭셔리 → \"고가\"\n"
+    "      · 적당한 가격, 보통 → \"중가\"\n"
+    "  - style        : 분위기/스타일 (조용한, 감성, 활기찬, 힐링, 여유) — null 또는 문자열\n"
+    "  - visual_intent: 감성, 분위기, 사진, 인스타, SNS, 예쁜, 데이트 키워드 포함 시 true — boolean\n\n"
 
     "【STEP 4】 sub_queries 생성 (COMPLEX 전용)\n"
     "  - 독립 검색 가능한 하위 쿼리 최대 3개로 분해하라.\n"
@@ -666,6 +670,7 @@ _REWRITE_SYSTEM_MSG = SystemMessage(content=
     ' "query_type": "KEYWORD|SEMANTIC|MIXED|COMPLEX",'
     ' "filters": {"category": [], "purpose": [], "weather": null,'
     ' "indoor_outdoor": null, "crowd": null, "budget": null, "style": null},'
+    ' "visual_intent": false,'
     ' "sub_queries": []}\n\n'
 
     "입출력 예시:\n"
@@ -673,19 +678,31 @@ _REWRITE_SYSTEM_MSG = SystemMessage(content=
     '출력: {"original_query": "노원 카페", "rewritten_query": "노원구 카페 조용한 분위기",'
     ' "query_type": "KEYWORD", "filters": {"category": ["카페"], "purpose": [],'
     ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": null, "style": null},'
-    ' "sub_queries": []}\n\n'
+    ' "visual_intent": false, "sub_queries": []}\n\n'
     '입력: "혼자 조용히 쉬고 싶어"\n'
     '출력: {"original_query": "혼자 조용히 쉬고 싶어",'
     ' "rewritten_query": "혼자 조용한 카페 힐링 여유 휴식 공간",'
     ' "query_type": "SEMANTIC", "filters": {"category": [], "purpose": ["혼자", "힐링"],'
     ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": null, "style": "조용한"},'
-    ' "sub_queries": []}\n\n'
+    ' "visual_intent": false, "sub_queries": []}\n\n'
     '입력: "카페에서 커피 마시고 공원도 산책하고 싶어"\n'
     '출력: {"original_query": "카페에서 커피 마시고 공원도 산책하고 싶어",'
     ' "rewritten_query": "카페 커피 공원 산책 힐링 여유",'
     ' "query_type": "COMPLEX", "filters": {"category": ["카페", "공원"], "purpose": ["힐링"],'
     ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": null, "style": null},'
-    ' "sub_queries": ["조용한 카페 커피 여유", "공원 산책 자연 힐링"]}'
+    ' "visual_intent": false, "sub_queries": ["조용한 카페 커피 여유", "공원 산책 자연 힐링"]}\n\n'
+    '입력: "가성비 좋은 맛집"\n'
+    '출력: {"original_query": "가성비 좋은 맛집",'
+    ' "rewritten_query": "저렴한 가성비 맛집 저가 식당",'
+    ' "query_type": "MIXED", "filters": {"category": ["음식점"], "purpose": ["친구"],'
+    ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": "저가", "style": null},'
+    ' "visual_intent": false, "sub_queries": []}\n\n'
+    '입력: "감성 카페 추천"\n'
+    '출력: {"original_query": "감성 카페 추천",'
+    ' "rewritten_query": "감성 분위기 사진 찍기 좋은 카페 인스타 SNS",'
+    ' "query_type": "MIXED", "filters": {"category": ["카페"], "purpose": ["데이트"],'
+    ' "weather": null, "indoor_outdoor": null, "crowd": null, "budget": null, "style": "감성"},'
+    ' "visual_intent": true, "sub_queries": []}'
 )
 
 _rewrite_prompt = ChatPromptTemplate.from_messages([
@@ -735,6 +752,7 @@ def rewrite_query(
         "rewritten_query": user_input,
         "query_type":      "SEMANTIC",
         "filters":         _empty_filters,
+        "visual_intent":   False,
         "sub_queries":     [],
         "keywords":        [],
     }
@@ -785,17 +803,19 @@ def rewrite_query(
             "rewritten_query": str(parsed.get("rewritten_query", user_input)),
             "query_type":      query_type,
             "filters":         filters,
+            "visual_intent":   bool(parsed.get("visual_intent", False)),
             "sub_queries":     sub_queries,
             "keywords":        filters["category"],  # BM25 하위 호환
         }
 
         print(
             f"[query rewrite]\n"
-            f"  input:      {result['original_query']}\n"
-            f"  rewritten:  {result['rewritten_query']}\n"
-            f"  type:       {result['query_type']}\n"
-            f"  filters:    {result['filters']}\n"
-            f"  sub_queries:{result['sub_queries']}"
+            f"  input:        {result['original_query']}\n"
+            f"  rewritten:    {result['rewritten_query']}\n"
+            f"  type:         {result['query_type']}\n"
+            f"  visual_intent:{result['visual_intent']}\n"
+            f"  filters:      {result['filters']}\n"
+            f"  sub_queries:  {result['sub_queries']}"
         )
 
         _REWRITE_CACHE[cache_key] = result
@@ -1518,6 +1538,10 @@ def run_recommendation_pipeline(
         faiss_weight=strategy["faiss_weight"],
         bm25_weight=strategy["bm25_weight"],
         diversity=strategy["diversity"],
+        query_type=rewrite["query_type"],
+        indoor_outdoor=filters.get("indoor_outdoor") or "",
+        visual_intent=rewrite.get("visual_intent", False),
+        filter_purposes=filters.get("purpose", []),
     )
 
     # ✅ Multi-step Retrieval — COMPLEX형일 때만 분해 실행
@@ -2186,6 +2210,10 @@ elif st.session_state.stage == 4:
                         faiss_weight=alt_strategy["faiss_weight"],
                         bm25_weight=alt_strategy["bm25_weight"],
                         diversity=alt_strategy["diversity"],
+                        query_type=rewrite["query_type"],
+                        indoor_outdoor=rewrite.get("filters", {}).get("indoor_outdoor") or "",
+                        visual_intent=rewrite.get("visual_intent", False),
+                        filter_purposes=rewrite.get("filters", {}).get("purpose", []),
                     )
 
                     # ✅ Multi-step Retrieval — COMPLEX형일 때만 분해 실행
