@@ -277,25 +277,27 @@ _ACTIVITY_ALLOWED = {
 
 def _apply_metadata_score(meta: dict, score: float, personality: str) -> float:
     """
-    성향·카테고리 불일치 시 점수 감소 (hard filter 대신 soft penalty).
+    personality_tags 개수 기반 soft scoring (hard filter 금지).
 
-    - is_general=True (구 균형형): 모든 성향에 패널티 없이 적용
-    - personality_tags에 요청 성향 없음 → × 0.85  (15% 감점)
-    - 액티비티형 + 비허용 카테고리     → 추가 × 0.70  (최대 40% 감점)
+    tags=0 : 미분류 → 중립 (패널티 없음)
+    tags=1 : 성향 명확 → 일치 ×1.15 / 불일치 ×0.75
+    tags=2 : 중간 성향 → 일치 ×1.08 / 불일치 ×0.90
+    tags≥3 : 범용(is_general) → 중립
 
-    결과적으로 불일치 장소는 하위 랭킹으로 밀리지만 완전 제외되지 않음.
-    (지역 내 허용 장소가 충분하지 않을 경우 fallback으로 활용)
+    액티비티형 + 비허용 카테고리 penalty는 별도 유지.
     """
     if not personality:
         return score
 
-    # 범용 장소(구 균형형)는 어떤 성향에도 패널티 없이 적합
-    if meta.get("is_general"):
-        return score
-
     p_tags = meta.get("personality_tags", [])
-    if p_tags and personality not in p_tags:
-        score *= 0.85
+    tag_count = len(p_tags)
+
+    if tag_count == 1:
+        score *= 1.15 if personality in p_tags else 0.75
+    elif tag_count == 2:
+        score *= 1.08 if personality in p_tags else 0.90
+    # tag_count == 0 또는 >= 3: 중립
+
     if personality == "액티비티형" and meta.get("카테고리") not in _ACTIVITY_ALLOWED:
         score *= 0.70
     return score
