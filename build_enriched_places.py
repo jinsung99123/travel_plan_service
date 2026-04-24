@@ -55,6 +55,33 @@ _CAFE_CATS     = {"카페", "디저트카페", "고양이카페"}
 _PARK_CATS     = {"공원", "테마거리"}
 _CULTURAL_CATS = {"공연장", "문화시설", "문화센터", "전시", "갤러리", "박물관"}
 
+# 가족 purpose 직접 확장 대상 카테고리 (성인 전용·야간 시설 제외)
+_FAMILY_CAT_DIRECT = {
+    "공원", "테마거리", "공연장", "문화시설", "문화센터",
+    "전통", "볼링", "스포츠", "체육관",
+}
+_FAMILY_EXCL_KW  = {"술", "야간", "바", "클럽", "성인"}
+_FAMILY_EXCL_CAT = {"당구장", "헬스", "테니스", "댄스"}  # 성인 전용 활동
+
+
+def _is_family_place(row: dict, kw_set: set) -> bool:
+    """가족 purpose 추가 여부 판단 (조건 기반, 무조건 추가 금지)."""
+    if kw_set & _FAMILY_EXCL_KW:
+        return False
+    cat   = row["카테고리"]
+    crowd = row["crowd_level"]
+    if cat in _FAMILY_EXCL_CAT:
+        return False
+    if cat in _FAMILY_CAT_DIRECT:
+        return True
+    if kw_set & {"체험", "전시", "놀이"} and crowd != "높음":
+        return True
+    if kw_set & {"공원", "산책"} and crowd == "낮음":
+        return True
+    if "가족" in kw_set:
+        return True
+    return False
+
 
 # ── purpose 동적 생성 ──────────────────────────────────────────────────────────
 def infer_purpose(row: dict, kw_set: set) -> list[str]:
@@ -93,11 +120,12 @@ def infer_purpose(row: dict, kw_set: set) -> list[str]:
     if kw_set & {"핫플"}:
         pool |= {"데이트", "친구"}
 
-    if kw_set & {"가족"}:
-        pool.add("가족")
-
     if kw_set & {"가성비", "맛집"}:
         pool |= {"친구", "혼자"}
+
+    # 가족 확장 (카테고리·키워드·조건 기반)
+    if _is_family_place(row, kw_set):
+        pool.add("가족")
 
     # crowd 보정
     if crowd == "낮음":
@@ -109,12 +137,14 @@ def infer_purpose(row: dict, kw_set: set) -> list[str]:
     if not pool:
         pool.add("혼자" if crowd == "낮음" else "친구")
 
-    # 우선순위 정렬 후 최대 3개
-    order = ["데이트", "친구", "혼자", "힐링", "활동", "가족"]
+    # 우선순위 정렬 — 가족 포함 시 최대 4개 (상위 3개 + 가족)
+    order  = ["데이트", "친구", "혼자", "힐링", "활동", "가족"]
     ranked = [p for p in order if p in pool]
-    if "가족" in kw_set and "가족" not in ranked[:3]:
-        return ranked[:2] + ["가족"]
-    return ranked[:3]
+    if "가족" not in pool:
+        return ranked[:3]
+    if "가족" in ranked[:3]:
+        return ranked[:3]
+    return [p for p in ranked if p != "가족"][:3] + ["가족"]
 
 
 # ── mood 동적 생성 ─────────────────────────────────────────────────────────────
