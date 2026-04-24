@@ -402,7 +402,11 @@ def build_page_content(row: dict, purpose: list[str], mood: list[str], region: s
     # 최종 조합: "목적+분위기+카테고리. 날씨+실내, 혼잡도. 설명. 특징."
     base = f"{sent1} {weather_indoor}, {crowd_desc}. {desc}"
     feature = _UNIQUE_FEATURE.get(row.get("장소명", ""), "")
-    return f"{base} 특징: {feature}" if feature else base
+    result = f"{base} 특징: {feature}" if feature else base
+
+    if "활동" in purpose:
+        result += " 이 장소는 운동, 체험, 스포츠 활동을 즐기기 좋은 장소입니다."
+    return result
 
 
 # ── plain_text 생성 (BM25용 키-값 구조) ──────────────────────────────────────
@@ -453,7 +457,12 @@ def build_plain_text(
         f"키워드: {kw_str}",
         f"지역: {region}",
     ]
-    return "\n".join(lines)
+    plain = "\n".join(lines)
+
+    if "활동" in purpose:
+        extra = "활동 활동적인 운동 체험 스포츠 레저 액티비티 야외활동 코스 데이트코스"
+        plain += " " + extra
+    return plain
 
 
 # ── persona.csv 기반 personality_tags 매핑 ───────────────────────────────────
