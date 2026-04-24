@@ -406,6 +406,36 @@ def build_page_content(row: dict, purpose: list[str], mood: list[str], region: s
 
     if "활동" in purpose:
         result += " 이 장소는 운동, 체험, 스포츠 활동을 즐기기 좋은 장소입니다."
+
+    # 메타데이터 기반 특징 문장 (최대 2개 — 문서 간 임베딩 차별화)
+    price   = row.get("price_level", "중가")
+    kw_set  = {k.strip() for k in row.get("키워드", "").split(",")}
+    feature_lines: list[str] = []
+
+    if crowd == "낮음":
+        feature_lines.append("조용하고 한산한 분위기로 혼자 방문하기 좋습니다.")
+    elif crowd == "높음":
+        feature_lines.append("활기찬 분위기로 사람들과 함께 즐기기 좋습니다.")
+
+    if indoor == "실내":
+        feature_lines.append("날씨와 관계없이 편안하게 이용할 수 있는 실내 공간입니다.")
+    elif indoor == "실외":
+        feature_lines.append("야외 공간에서 자연을 느끼며 시간을 보낼 수 있습니다.")
+
+    if price == "저가":
+        feature_lines.append("가성비 좋은 가격대로 부담 없이 방문할 수 있습니다.")
+    elif price == "고가":
+        feature_lines.append("특별한 날 방문하기 좋은 분위기와 가격대를 갖추고 있습니다.")
+
+    if kw_set & {"SNS", "사진"}:
+        feature_lines.append("사진 촬영이나 SNS 공유에 적합한 공간입니다.")
+    if kw_set & {"뷰", "루프탑"}:
+        feature_lines.append("전망이 좋아 여유롭게 시간을 보내기 좋은 장소입니다.")
+    if "데이트" in kw_set:
+        feature_lines.append("연인과 함께 방문하기 좋은 분위기를 제공합니다.")
+
+    if feature_lines:
+        result += " " + " ".join(feature_lines[:2])
     return result
 
 
