@@ -334,9 +334,9 @@ API Key를 이미지 레이어에 포함하지 않기 위해 `docker-entrypoint.
 
 ### 클라우드 배포
 
-| 플랫폼 | 배포 방식 | 생성 URL |
-|--------|---------|---------|
-| Render | GitHub 연동 → Dockerfile 자동 감지 → 환경변수 설정 | `https://<name>.onrender.com` |
-| Railway | GitHub 연동 → Dockerfile 자동 감지 → Generate Domain | `https://<name>.up.railway.app` |
+| 플랫폼 | 배포 방식 |
+|--------|---------|
+| Render | GitHub 연동 → Dockerfile 자동 감지 → 환경변수 설정 |
+| Railway | GitHub 연동 → Dockerfile 자동 감지 → Generate Domain |
 
 공통 절차: GitHub 리포지토리 연결 → Docker 빌드 방식 선택 → `OPENAI_API_KEY` 환경변수 설정 → 배포.
