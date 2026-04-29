@@ -92,36 +92,34 @@ Semantic Reranking(LLM 재정렬)은 정확도를 높이지만 추가 API 호출
 
 ```mermaid
 graph TD
-    U([사용자]) --> UI[Streamlit UI]
+    U([User]) --> UI[Streamlit UI]
 
-    subgraph RAG Service - 05_travel_plan_service
-        UI --> QR[Query Rewrite<br/>LLM - 자연어 → 검색 최적화]
-        QR --> QO[Query Optimization<br/>Rule-based - 쿼리 타입 분류]
-
-        QO -->|COMPLEX| MS[Multi-step Retrieval<br/>복합 쿼리 분해 + 병합]
-        QO -->|그 외| HS
-
-        MS --> HS[Hybrid Search<br/>FAISS + BM25]
-        HS --> MD[Metadata Scoring<br/>성향 / 날씨 / 예산 / 혼잡도]
-        MD --> SR[Semantic Reranking<br/>LLM 적합도 재정렬]
-        SR --> GEN[Itinerary Generation<br/>GPT-4o - Day-by-Day 일정]
-        GEN --> VAL[Validation<br/>Hallucination 감지]
+    subgraph RAG_Service
+        UI --> QR[Query Rewrite]
+        QR --> QO[Query Optimization]
+        QO -->|COMPLEX| MS[Multi-step Retrieval]
+        QO -->|기타| HS[Hybrid Search]
+        MS --> HS
+        HS --> MD[Metadata Scoring]
+        MD --> SR[Semantic Reranking]
+        SR --> GEN[Itinerary Generation]
+        GEN --> VAL[Validation]
         VAL --> UI
     end
 
-    subgraph Agent Service - agents/
-        UI2([사용자]) --> AG[Multi Agent UI<br/>Streamlit]
-        AG --> ORC[Orchestrator Agent<br/>LLM x2]
-        ORC --> RA[Retrieval Agent<br/>RAG only]
-        ORC --> CA[Course Agent<br/>Python only]
+    subgraph Agent_Service
+        UI2([User]) --> AG[Multi Agent UI]
+        AG --> ORC[Orchestrator Agent]
+        ORC --> RA[Retrieval Agent]
+        ORC --> CA[Course Agent]
         CA --> ORC
         RA --> ORC
         ORC --> AG
     end
 
     subgraph Data
-        DB[(places_enriched.json<br/>장소 + 메타데이터)]
-        IDX[(FAISS Index<br/>벡터 인덱스)]
+        DB[(places_enriched.json)]
+        IDX[(FAISS Index)]
         DB --> HS
         DB --> IDX
         IDX --> HS
@@ -276,6 +274,10 @@ export OPENAI_API_KEY="sk-..."
 ```
 
 ### 실행
+
+> **실행 위치:** 모든 명령은 `05_travel_plan_service/` 디렉토리에서 실행해야 한다.  
+> 각 파일이 `__file__` 기준 절대 경로로 의존성을 해석하므로, 어느 경로에서 실행해도 동작하지만  
+> 아래 명령은 해당 디렉토리를 현재 경로로 가정한다.
 
 **여행 일정 추천 서비스 (메인)**
 
