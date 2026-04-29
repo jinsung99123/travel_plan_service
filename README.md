@@ -1,463 +1,300 @@
-# RAG 기반 개인화 여행 일정 추천 시스템
+# 노원구 여행 추천 서비스
 
-> 단순한 LLM 생성이 아닌, **검색 기반 근거 있는 추천**을 지향하는 여행 플래닝 시스템
+> **RAG 기반 장소 검색 → Multi Agent 추천**까지,  
+> 문제 정의부터 설계 결정까지 단계적으로 발전시킨 AI 추천 시스템
 
 ---
 
 ## 목차
 
-1. [프로젝트 소개](#1-프로젝트-소개)
-2. [주요 기능](#2-주요-기능)
-3. [시스템 아키텍처](#3-시스템-아키텍처)
-4. [Retrieval 고도화 과정](#4-retrieval-고도화-과정)
-5. [데이터 구조](#5-데이터-구조)
-6. [Hallucination 방지 전략](#6-hallucination-방지-전략)
-7. [실행 방법](#7-실행-방법)
-8. [배포 구조](#8-배포-구조)
-9. [향후 개선 방향](#9-향후-개선-방향)
+1. [서비스 목적 및 문제 정의](#1-서비스-목적-및-문제-정의)
+2. [해결 방향](#2-해결-방향)
+3. [트레이드오프 및 설계 결정](#3-트레이드오프-및-설계-결정)
+4. [시스템 아키텍처](#4-시스템-아키텍처)
+5. [에이전트 파이프라인](#5-에이전트-파이프라인)
+6. [프로젝트 진화 경로](#6-프로젝트-진화-경로)
+7. [기술 스택](#7-기술-스택)
+8. [실행 방법](#8-실행-방법)
 
 ---
 
-## 1. 프로젝트 소개
+## 1. 서비스 목적 및 문제 정의
 
-### 문제 정의
+### 기존 방식의 한계
 
-기존 여행 추천 서비스는 크게 두 가지 방식으로 동작한다.
+여행지 추천 서비스는 크게 두 가지 방식으로 구현된다.
 
-- **규칙 기반 필터링**: 지역·카테고리 조건으로 목록을 반환하지만 사용자 의도를 반영하지 못함
-- **LLM 직접 생성**: 유창한 문장을 생성하지만 실존하지 않는 장소, 폐업한 가게, 부정확한 위치를 포함하는 **Hallucination** 문제가 존재
+**규칙 기반 필터링**은 지역·카테고리 조건으로 목록을 반환하지만, "비 오는 날 조용하게 데이트하고 싶다"처럼 복합적인 사용자 의도를 반영하지 못한다.
 
-두 방식 모두 "이 사람이 지금 무엇을 원하는가"를 정밀하게 이해하고 근거 있는 장소를 추천하는 데 한계가 있다.
+**LLM 직접 생성**은 유창한 문장을 만들지만, 실존하지 않는 장소·폐업한 가게·부정확한 주소를 포함하는 **Hallucination** 문제가 구조적으로 내재되어 있다.
 
-### 해결 방식
+### 핵심 문제 3가지
 
-이 프로젝트는 **RAG(Retrieval-Augmented Generation)** 구조를 핵심으로 삼는다.
-
-- 실제 장소 데이터를 벡터 DB에 인덱싱하고, 사용자 쿼리와 의미적으로 가장 가까운 장소를 검색
-- 검색된 장소만을 컨텍스트로 LLM에 전달해 일정을 생성함으로써 Hallucination을 구조적으로 차단
-- 사용자 성향(힐링형·미식형 등), 날씨, 예산, 혼잡도 등 메타데이터를 점수에 반영해 개인화를 강화
-
-단순 키워드 검색에 그치지 않고, **Query Rewrite → Query Optimization → Hybrid Search → Reranking** 까지 단계별 Retrieval 고도화를 적용했다.
-
----
-
-## 2. 주요 기능
-
-### 사용자 입력 → 추천 흐름
-
-```
-[성향 진단] 6가지 질문으로 여행 성향 분류
-     ↓
-[조건 입력] 지역 / 여행 기간 / 날씨 / 예산 / 혼잡도 선호
-     ↓
-[RAG 검색] 성향·지역·조건에 맞는 장소 검색
-     ↓
-[일정 생성] 검색된 장소 기반 Day-by-Day 일정 생성
-     ↓
-[검증] 생성된 일정의 장소가 실제 DB에 존재하는지 검증
-```
-
-### 개인화 요소
-
-| 요소 | 설명 |
+| 문제 | 증상 |
 |------|------|
-| 여행 성향 | 힐링형 / 액티비티형 / 탐방형 / 미식형 / 감성형 / 균형형 |
-| 날씨 | 실내·실외 선호도에 따른 장소 점수 조정 |
-| 예산 | 가격대 메타데이터 기반 소프트 필터링 |
-| 혼잡도 | 조용 / 활기 선호에 따른 장소 가중치 적용 |
-| 여행 스타일 | 빠르게 / 여유롭게 슬라이더로 체류 시간 가중치 조정 |
-
-### 일정 생성 방식
-
-- 검색된 장소 목록을 컨텍스트로 GPT-4o에 전달
-- Day-by-Day, 오전/오후/저녁 단위의 동선 구성
-- 동일 지역(동 단위) 장소끼리 인접 배치로 이동 최적화
-- 스트리밍 출력으로 대기 없이 실시간 표시
+| **의도 미반영** | "쉬고 싶어"를 카페·공원과 연결하지 못함 |
+| **단일 검색 편향** | "카페도 가고 밥도 먹고 싶어" → 카페만 나옴 |
+| **Hallucination** | LLM이 없는 장소를 생성해 신뢰도 훼손 |
 
 ---
 
-## 3. 시스템 아키텍처
+## 2. 해결 방향
 
-### 전체 파이프라인
+### RAG 구조 도입
+
+검색된 실제 장소 데이터만을 LLM 컨텍스트로 제공함으로써 Hallucination을 **구조적으로** 차단했다. LLM은 생성이 아닌 **추천 설명 작성**에만 사용된다.
+
+### Hybrid Search 선택
+
+FAISS(의미 검색)만 사용하면 "카페"처럼 명확한 키워드 쿼리에서 카테고리 매칭이 약하다. BM25(키워드 검색)만 사용하면 "조용하게 쉴 수 있는 곳" 같은 의미 쿼리가 동작하지 않는다.
+
+두 방식을 결합해 **쿼리 타입에 따라 가중치를 동적으로 조정**하는 Hybrid Search를 설계했다.
+
+### Multi-step Retrieval 설계
+
+복합 요청("카페 → 식사 → 산책 코스")을 단일 쿼리로 검색하면 하나의 카테고리에 결과가 편향된다. 쿼리를 카테고리별 하위 쿼리로 분해하고 독립 검색 후 병합하는 방식으로 이 문제를 해결했다.
+
+### Agent 구조 도입
+
+검색 로직이 복잡해질수록 단일 스크립트의 유지보수성이 낮아졌다. **의도 파악 → 검색 → 코스 조합 → 응답 생성**의 각 단계를 독립 Agent로 분리해 역할 경계를 명확히 했다.
+
+---
+
+## 3. 트레이드오프 및 설계 결정
+
+### FAISS vs BM25 → Hybrid 선택
+
+| 방식 | 강점 | 약점 |
+|------|------|------|
+| FAISS | 의미·문맥 검색 | 정확한 키워드 매칭 약함 |
+| BM25 | 키워드 정확 매칭 | 의미·성향 쿼리 처리 약함 |
+| **Hybrid** | 두 방식 결합 | weight 튜닝 필요 |
+
+쿼리 타입을 `KEYWORD / SEMANTIC / MIXED / COMPLEX` 4종으로 분류하고 타입별로 weight를 자동 결정해 추가 LLM 호출 없이 효율을 확보했다.
+
+### Rule-based vs LLM Agent → Hybrid 선택
+
+의도 파악(intent parsing)과 응답 생성(response generation)은 LLM이 담당하고, 검색(Retrieval)과 코스 조합(Course building)은 순수 Python 로직으로 구현했다.
+
+LLM을 모든 단계에 사용하면 비용과 지연이 증가하고, 완전 rule-based는 자연어 의도를 해석하지 못한다. **LLM 호출을 2회로 제한**하고 나머지는 결정론적 로직으로 처리했다.
+
+### filtering vs soft_sort 선택
+
+지역 외 장소가 검색 결과에 포함될 때 완전 필터링을 적용하면 결과 수가 줄어 다양성이 손실된다. 대신 **soft_sort** 방식을 채택해 결과를 제거하지 않고 관련도 높은 항목을 상위로 재정렬했다.
+
+### 성능 vs 유연성
+
+Semantic Reranking(LLM 재정렬)은 정확도를 높이지만 추가 API 호출 비용이 발생한다. MD5 캐싱으로 동일 입력의 재호출을 방지했고, Multi Agent 구조에서는 Reranking 없이 BM25 hybrid + soft_sort만으로 응답 품질을 유지했다.
+
+---
+
+## 4. 시스템 아키텍처
+
+```mermaid
+graph TD
+    U([사용자]) --> UI[Streamlit UI]
+
+    subgraph RAG Service - 05_travel_plan_service
+        UI --> QR[Query Rewrite<br/>LLM - 자연어 → 검색 최적화]
+        QR --> QO[Query Optimization<br/>Rule-based - 쿼리 타입 분류]
+
+        QO -->|COMPLEX| MS[Multi-step Retrieval<br/>복합 쿼리 분해 + 병합]
+        QO -->|그 외| HS
+
+        MS --> HS[Hybrid Search<br/>FAISS + BM25]
+        HS --> MD[Metadata Scoring<br/>성향 / 날씨 / 예산 / 혼잡도]
+        MD --> SR[Semantic Reranking<br/>LLM 적합도 재정렬]
+        SR --> GEN[Itinerary Generation<br/>GPT-4o - Day-by-Day 일정]
+        GEN --> VAL[Validation<br/>Hallucination 감지]
+        VAL --> UI
+    end
+
+    subgraph Agent Service - agents/
+        UI2([사용자]) --> AG[Multi Agent UI<br/>Streamlit]
+        AG --> ORC[Orchestrator Agent<br/>LLM x2]
+        ORC --> RA[Retrieval Agent<br/>RAG only]
+        ORC --> CA[Course Agent<br/>Python only]
+        CA --> ORC
+        RA --> ORC
+        ORC --> AG
+    end
+
+    subgraph Data
+        DB[(places_enriched.json<br/>장소 + 메타데이터)]
+        IDX[(FAISS Index<br/>벡터 인덱스)]
+        DB --> HS
+        DB --> IDX
+        IDX --> HS
+    end
+```
+
+### 데이터 파이프라인
+
+장소 데이터는 단순 CSV가 아닌 **Contextual Embedding** 전략으로 구조화된다.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         User Input                              │
-│            (성향 / 지역 / 날씨 / 예산 / 혼잡도 / 스타일)           │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Query Rewrite                              │
-│  - 자연어 → 검색 최적화 문장으로 변환                              │
-│  - 장소 유형 / 분위기 / 활동 키워드 추출                           │
-│  - 성향 추론 (힐링형 / 미식형 / …)                                │
-│  - 출력: rewritten_query + keywords + intent                    │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Query Optimization                           │
-│  - 쿼리 타입 자동 분류: KEYWORD / SEMANTIC / MIXED / COMPLEX      │
-│  - 타입별 검색 전략 결정                                          │
-│    KEYWORD  → BM25 가중치 ↑ (0.7)                               │
-│    SEMANTIC → FAISS 가중치 ↑ (0.7)                              │
-│    COMPLEX  → Multi-step 활성화 + top_k 확장                    │
-│  - 출력: faiss_weight / bm25_weight / top_k / diversity / …    │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-              COMPLEX형만            그 외 타입
-                    │                     │
-                    ▼                     │
-┌──────────────────────────┐             │
-│   Multi-step Retrieval   │             │
-│  - 복합 쿼리 → 하위 쿼리   │             │
-│    분해 (최대 3개)         │             │
-│  - 쿼리별 독립 검색 후      │             │
-│    id 기반 결과 병합        │             │
-└────────────┬─────────────┘             │
-             │                           │
-             └──────────┬────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Hybrid Search (FAISS + BM25)                   │
-│  - FAISS: rewritten_query 임베딩 기반 의미 검색                   │
-│  - BM25 : rewritten_query + keywords 키워드 검색                 │
-│  - 최종 점수 = faiss_weight × FAISS + bm25_weight × BM25        │
-│  - top_k × 6 후보 풀 확장                                        │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Metadata Scoring                           │
-│  - Personality Scoring: 성향 불일치 시 ×0.85 패널티              │
-│  - Extended Scoring   : 날씨 / 예산 / 혼잡도 / 체류시간 보정      │
-│  - 지역 필터 (sigungu 기반, fallback 포함)                        │
-│  - 카테고리 다양성: 동일 카테고리 최대 3개 제한                     │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Semantic Reranking                           │
-│  - diversity 기반 샘플링 풀 조정                                  │
-│  - GPT-4o가 후보 장소 적합도 0~1 점수 부여                        │
-│  - 최종 점수 = base × (1 - rw) + rerank × rw                   │
-│  - MD5 캐싱으로 동일 입력 재호출 방지                              │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Itinerary Generation                         │
-│  - 검색된 장소만 컨텍스트로 GPT-4o 전달                           │
-│  - Day-by-Day / 오전·오후·저녁 단위 동선 구성                     │
-│  - 동선 최적화: 동(洞) 단위 인접 장소 그룹화                        │
-│  - 스트리밍 출력                                                  │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       Validation                                │
-│  - 생성된 일정의 장소명을 DB 데이터와 대조                          │
-│  - 검증됨 / 미검증 분류 및 신뢰도 점수 계산                         │
-│  - Hallucination 탐지 결과 UI에 표시                             │
-└─────────────────────────────────────────────────────────────────┘
+[힐링형, 감성형] 성향 여행자가 노원구에서 방문할 수 있는 카페.
+장소명: ○○카페
+키워드: 카페 감성 여유 조용
+설명: 조용한 분위기의 소규모 감성 카페
+plain_text: 힐링 데이트 혼자 여유 실내 맑음
 ```
 
-### 기술 스택
+성향·지역·목적을 앞에 배치해 임베딩 모델이 "누구를 위해, 어디에, 어떤 목적"인지를 벡터에 반영하게 했다.
+
+---
+
+## 5. 에이전트 파이프라인
+
+```mermaid
+graph TD
+    Q([사용자 쿼리]) --> ORC
+
+    subgraph Orchestrator Agent - LLM x2
+        ORC[parse_intent<br/>LLM 1회 - course or single]
+        ORC --> BR{의도 분기}
+        BR -->|course| RET_C[Retrieval Agent<br/>Multi-step search]
+        BR -->|single| RET_S[Retrieval Agent<br/>단일 검색]
+        RET_C --> THR{결과 수 ≥ 5?}
+        THR -->|No| FB1[Fallback → single 검색]
+        THR -->|Yes| CRS[Course Agent]
+        CRS --> VLD{검증 통과?}
+        VLD -->|No| FB2[Fallback → single 검색]
+        VLD -->|Yes| GR
+        RET_S --> SORT[soft_sort<br/>키워드 기반 재정렬]
+        SORT --> THR2{결과 수 ≥ 5?}
+        THR2 -->|No| FB3[Fallback - 카페 맛집 추천]
+        THR2 -->|Yes| GR
+        FB1 --> GR
+        FB2 --> GR
+        FB3 --> GR
+        GR[generate_response<br/>LLM 1회]
+    end
+
+    GR --> OUT([추천 결과 반환])
+```
+
+### Agent 역할 분리 원칙
+
+| Agent | 역할 | LLM 사용 |
+|-------|------|----------|
+| **Orchestrator** | 의도 파악, 흐름 제어, 응답 생성 | ✅ 2회 |
+| **Retrieval** | RAG 기반 장소 검색 | ❌ |
+| **Course** | 카테고리 기반 코스 조합 및 검증 | ❌ |
+
+LLM 호출을 Orchestrator의 2회로 제한함으로써 비용과 지연을 제어하면서 자연어 처리 능력을 유지했다.
+
+### Fallback 전략
+
+```
+검색 결과 < 5개  →  단일 추천 fallback
+코스 조합 실패   →  단일 추천 fallback  
+검증 실패        →  단일 추천 fallback
+```
+
+3단계 fallback을 통해 어떤 엣지 케이스에서도 응답이 반환되도록 설계했다. trace 리스트에 각 단계의 실행 경로가 기록되어 디버깅과 모니터링이 가능하다.
+
+---
+
+## 6. 프로젝트 진화 경로
+
+```mermaid
+graph LR
+    A[기본 RAG<br/>FAISS 단일 검색] --> B[Contextual Embedding<br/>구조화된 page_content]
+    B --> C[Hybrid Search<br/>FAISS + BM25]
+    C --> D[Query Rewrite<br/>자연어 → 검색 최적화]
+    D --> E[Query Optimization<br/>쿼리 타입 자동 분류]
+    E --> F[Multi-step Retrieval<br/>복합 쿼리 분해]
+    F --> G[Semantic Reranking<br/>LLM 재정렬]
+    G --> H[Single Agent<br/>통합 제어]
+    H --> I[Multi Agent<br/>역할 분리]
+
+    style A fill:#e8f4fd
+    style C fill:#d4edda
+    style G fill:#fff3cd
+    style I fill:#f8d7da
+```
+
+### 단계별 문제와 해결
+
+**기본 RAG → Contextual Embedding**  
+단순 텍스트 concat 임베딩은 "힐링형 여행자에게 맞는 장소"를 벡터에 반영하지 못했다. page_content를 성향·지역·카테고리를 포함한 구조화된 자연어로 재구성했다.
+
+**Hybrid Search 도입**  
+FAISS 단독 사용 시 "카페" 같은 키워드형 쿼리에서 카테고리 매칭이 불안정했다. BM25를 추가해 키워드 정확도를 확보하고, 쿼리 타입별 weight 조정으로 두 방식의 장점을 선택적으로 활용했다.
+
+**고도화 과정에서 발견·수정된 문제들**
+
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| 카페 결과 쏠림 | 카페 page_content 중복 패턴 | 카테고리별 최대 3개 다양성 제한 |
+| 활동 쿼리 완전 실패 | `activity` 토큰 BM25 미포함 | `plain_text`에 활동 어휘 명시적 추가 |
+| is_general 97% | 판별 기준 과도하게 넓음 | 조건 세분화로 비율 정상화 |
+| 가족 purpose 부족 | 가족 관련 키워드 매핑 누락 | persona 키워드 확장 |
+
+**Single Agent → Multi Agent**  
+검색·코스 조합·응답 생성이 하나의 스크립트에 뒤섞이면서 유지보수가 어려워졌다. Orchestrator / Retrieval / Course Agent로 역할을 분리해 각 Agent가 단일 책임을 갖도록 구조화했다. 이 과정에서 검증 로직(validate_course)과 trace 기반 실행 추적이 추가됐다.
+
+---
+
+## 7. 기술 스택
 
 | 영역 | 기술 |
 |------|------|
-| Frontend | Streamlit |
-| Backend | FastAPI |
-| LLM | OpenAI GPT-4o |
-| Vector Search | FAISS |
-| Keyword Search | BM25 (rank-bm25) |
-| Embedding | OpenAI text-embedding-ada-002 |
-| LLM Framework | LangChain |
 | Language | Python 3.11+ |
+| UI | Streamlit |
+| LLM | OpenAI GPT-4o / GPT-4o-mini |
+| LLM Framework | LangChain |
+| Dense Search | FAISS (OpenAI text-embedding-ada-002) |
+| Sparse Search | BM25 (rank-bm25) |
+| Data | JSON (places_enriched.json) |
 
 ---
 
-## 4. Retrieval 고도화 과정
+## 8. 실행 방법
 
-단계별로 무엇이 문제였고, 왜 이 기능을 추가했는지를 중심으로 설명한다.
-
----
-
-### Step 1 — 기본 RAG
-
-**구조**: 사용자 입력 → FAISS 검색 → LLM 전달
-
-**문제**: 쿼리가 단순 자연어 그대로 임베딩되어 의미 전달이 불충분했다. "쉬고 싶은 곳"이라는 입력이 "조용한 카페, 힐링 공간" 같은 구체적 장소 유형과 연결되지 않았다.
-
----
-
-### Step 2 — Contextual Embedding
-
-**추가 이유**: 장소 Document를 단순 텍스트 concat 방식으로 임베딩하면 "이 장소가 누구를 위한 것인지"가 벡터에 반영되지 않는다.
-
-**변경 내용**: `page_content`를 구조화된 자연어 컨텍스트로 재구성
-
-```
-[힐링형, 감성형] 성향 여행자가 서울 마포구에서 방문할 수 있는 카페.
-장소명: 연남동 브런치카페
-키워드: 카페 감성 여유 조용
-설명: 조용한 분위기의 소규모 감성 카페
-```
-
-성향·지역·카테고리를 앞에 배치해 임베딩 모델이 "누구를 위해, 어디에, 어떤 목적"인지를 벡터에 반영하게 했다.
-
----
-
-### Step 3 — Hybrid Search (FAISS + BM25)
-
-**추가 이유**: FAISS만으로는 "카페"처럼 명확한 키워드 쿼리에서 정확한 카테고리 매칭이 약했다. 의미 검색과 키워드 검색의 장점을 결합할 필요가 있었다.
-
-**구조**:
-```
-최종 점수 = faiss_weight × FAISS 점수 + bm25_weight × BM25 점수
-```
-
-BM25는 카테고리·키워드·설명을 대상으로 토큰 검색하고, FAISS는 전체 의미 유사도를 담당한다. 두 결과를 min-max 정규화 후 id 기준으로 합산한다.
-
----
-
-### Step 4 — Semantic Reranking
-
-**추가 이유**: Hybrid Search 이후에도 점수 순서가 사용자 의도와 항상 일치하지 않았다. 특히 날씨·예산·성향을 복합적으로 고려한 우선순위 조정이 규칙 기반으로는 한계가 있었다.
-
-**구조**:
-```
-GPT-4o가 후보 장소 목록에 적합도 점수(0~1) 부여
-최종 점수 = base_score × (1 - rerank_weight) + rerank_score × rerank_weight
-```
-
-동일 입력에 대해 MD5 해시 캐싱을 적용해 LLM 재호출을 방지했다.
-
----
-
-### Step 5 — Query Rewrite
-
-**추가 이유**: 사용자가 입력하는 자연어("좀 쉬고 싶어", "분위기 있는 데")는 검색 쿼리로서 정보가 부족하다. 검색에 최적화된 형태로 변환해야 FAISS 임베딩과 BM25 키워드 검색 모두 성능이 오른다.
-
-**구조**:
-```
-입력: "좀 쉬고 싶어"
-출력: {
-  rewritten_query: "조용한 카페 힐링 공간 여유로운 분위기",
-  keywords: ["카페", "힐링", "조용", "여유"],
-  intent: "힐링형"
-}
-```
-
-`rewritten_query`는 FAISS 임베딩에, `keywords`는 BM25 추가 토큰으로 각각 활용한다.
-
----
-
-### Step 6 — Multi-step Retrieval
-
-**추가 이유**: "카페도 가고 맛집도 찾고 싶어" 같은 복합 요청은 단일 쿼리로 검색하면 하나의 카테고리에 편향된 결과가 나온다.
-
-**구조**:
-```
-복합 쿼리 → LLM이 독립 하위 쿼리로 분해 (최대 3개)
-각 하위 쿼리별 retrieve_places() 독립 실행
-id 기반 중복 제거 후 결과 병합
-```
-
-단순 쿼리는 분해하지 않아 불필요한 LLM 호출을 방지했다.
-
----
-
-### Step 7 — Query Optimization
-
-**추가 이유**: 쿼리 타입에 따라 최적 검색 전략이 다르다. "카페" 같은 키워드형 쿼리에는 BM25가, "조용하게 쉴 수 있는 곳" 같은 의미형 쿼리에는 FAISS가 더 효과적이다. 매번 동일한 weight를 쓰는 것은 비효율적이다.
-
-**분류 체계**:
-
-| 타입 | 특징 | 전략 |
-|------|------|------|
-| KEYWORD | 짧고 명확한 카테고리 명사 | BM25 0.7 / FAISS 0.3 |
-| SEMANTIC | 자연어, 의미 중심 | FAISS 0.7 / BM25 0.3 |
-| MIXED | 키워드 + 의미 혼합 | 균등 0.5 / 0.5, top_k 20 |
-| COMPLEX | 복합 요청, 연결어 포함 | Multi-step 활성화, top_k 30 |
-
-규칙 기반으로 분류해 추가 LLM 호출 없이 즉시 결정된다.
-
----
-
-## 5. 데이터 구조
-
-### places.csv — 기본 스키마
-
-| 컬럼 | 설명 |
-|------|------|
-| `id` | 장소 고유 ID |
-| `장소명` | 장소 이름 |
-| `카테고리` | 음식점 / 카페 / 공원 / 박물관 등 |
-| `키워드` | 쉼표 구분 키워드 목록 |
-| `설명` | 장소 간단 설명 |
-| `주소` | 전체 주소 (시도 + 시군구 + 동 파싱에 사용) |
-
-### places_extended.csv — 확장 메타데이터
-
-| 컬럼 | 설명 | 활용 |
-|------|------|------|
-| `stay_time` | 평균 체류 시간 (분) | 여행 스타일(빠름/여유) 매칭 |
-| `crowd_level` | 혼잡도 (낮음/보통/높음) | 혼잡도 선호 필터링 |
-| `best_time` | 추천 방문 시간대 | 일정 구성 시 참고 |
-| `price_level` | 가격대 (저/중/고) | 예산 조건 매칭 |
-| `indoor_outdoor` | 실내/실외 구분 | 날씨 기반 점수 조정 |
-| `weather_fit` | 날씨 적합성 | 날씨 조건 보정 |
-
-### persona.csv — 성향 키워드 매핑
-
-| 컬럼 | 설명 |
-|------|------|
-| `성향` | 힐링형 / 액티비티형 / 탐방형 / 미식형 / 감성형 / 균형형 |
-| `핵심키워드` | 성향과 강하게 매칭되는 키워드 |
-| `보조키워드` | 연관 키워드 |
-| `설명` | 성향 설명 텍스트 |
-
-장소 Document 빌드 시 `persona.csv`의 키워드와 장소 키워드의 교집합으로 `personality_tags`를 생성한다. 이 태그가 Metadata Scoring의 성향 패널티 기준이 된다.
-
----
-
-## 6. Hallucination 방지 전략
-
-### 구조적 차단 — RAG 기반 컨텍스트 제한
-
-LLM에게 전달되는 장소 정보는 반드시 DB에서 검색된 실제 장소만으로 구성된다. "다음 장소들 중에서 일정을 구성하라"는 방식으로 프롬프트를 작성해 LLM이 데이터베이스 외의 장소를 임의로 생성하지 못하도록 했다.
-
-```
-[프롬프트 구조]
-당신은 여행 플래너입니다.
-아래 장소 목록만 사용해서 {days}일 일정을 작성하세요.
-
-[검색된 장소 목록]
-- 연남동 브런치카페 (카페) | 키워드: 감성 조용 여유 | 주소: 서울 마포구 ...
-- 경의선 숲길공원 (공원)  | 키워드: 산책 힐링 자연 | 주소: 서울 마포구 ...
-...
-```
-
-### 사후 검증 — Validator
-
-일정 생성 후 생성된 텍스트에서 장소명을 추출하고 DB 데이터와 대조한다.
-
-```
-검증됨   → 실제 DB에 존재하는 장소
-미검증   → DB에서 확인되지 않은 장소 (Hallucination 의심)
-```
-
-검증 결과와 신뢰도 점수를 UI에 표시해 사용자가 결과의 신뢰 수준을 직접 확인할 수 있게 했다.
-
----
-
-## 7. 실행 방법
-
-### 사전 준비
+### 설치
 
 ```bash
-git clone https://github.com/jinsung99123/travel_plan_service.git
-cd travel_plan_service
+git clone <repository-url>
+cd 05_travel_plan_service
 pip install -r requirements.txt
 ```
 
-OpenAI API 키 설정:
+### API 키 설정
+
+`.streamlit/secrets.toml` 파일 생성:
 
 ```toml
-# .streamlit/secrets.toml
 OPENAI_API_KEY = "sk-..."
 ```
 
-### Streamlit 로컬 실행
+또는 환경 변수로 설정:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+### 실행
+
+**여행 일정 추천 서비스 (메인)**
 
 ```bash
 streamlit run app.py
 ```
 
-### Docker 실행 (Backend)
+**Multi Agent 추천 서비스**
 
 ```bash
-docker build -t travel-plan-api .
-docker run -p 8000:8000 -e OPENAI_API_KEY=sk-... travel-plan-api
+streamlit run agents/multi_agent/app.py
 ```
 
-### FastAPI 백엔드 단독 실행
+**Agent 테스트**
 
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+# Multi Agent 종합 검증 (8 시나리오)
+python -X utf8 agents/multi_agent/test_final.py
+
+# Single Agent CLI
+python agents/single_agent/agent.py "노원 데이트 코스 추천해줘"
 ```
-
----
-
-## 8. 배포 구조
-
-```
-┌─────────────────────────────────────────┐
-│           Streamlit Cloud               │
-│   (Frontend — app.py)                   │
-│   - 사용자 UI 및 파이프라인 실행          │
-└──────────────────┬──────────────────────┘
-                   │ HTTP (FastAPI)
-                   ▼
-┌─────────────────────────────────────────┐
-│           Docker Container              │
-│   (Backend — FastAPI api.py)            │
-│   - RAG 검색 / 일정 생성 API 제공        │
-│   - FAISS 인덱스 로드 및 서빙            │
-└──────────────────┬──────────────────────┘
-                   │ 터널링
-                   ▼
-┌─────────────────────────────────────────┐
-│              ngrok                      │
-│   (개발·테스트 환경 외부 노출용)           │
-└─────────────────────────────────────────┘
-```
-
-| 구성 요소 | 플랫폼 | 역할 |
-|-----------|--------|------|
-| Frontend | Streamlit Cloud | UI 및 파이프라인 오케스트레이션 |
-| Backend | Docker | RAG API 서버 |
-| 인덱스 | 로컬 / Docker 볼륨 | FAISS 벡터 인덱스 저장 |
-| 터널 | ngrok | 로컬 Docker를 외부에서 접근 가능하게 노출 |
-
----
-
-## 9. 향후 개선 방향
-
-### Reranking 고도화
-
-현재 Reranking은 GPT-4o 기반 단일 패스로 동작한다. Cross-encoder 기반 경량 모델(예: `bge-reranker`)을 도입해 LLM 비용 없이 정밀도를 높일 수 있다.
-
-### Multi-agent 구조 전환
-
-현재 단일 파이프라인으로 구성된 시스템을 역할 분리된 Agent 구조로 전환:
-- **Planner Agent**: 쿼리 분해 및 전략 결정
-- **Retrieval Agent**: 장소 검색 및 후보 구성
-- **Generator Agent**: 일정 생성
-- **Validator Agent**: 결과 검증
-
-### 데이터 확장
-
-현재 노원구·마포구 등 일부 지역 중심이다. 전국 지역 데이터 확장 및 크롤링 파이프라인 구축이 필요하다. 사용자 리뷰 데이터를 추가 메타데이터로 활용하면 추천 품질이 향상될 수 있다.
-
-### 개인화 강화
-
-현재는 세션 내 단일 성향 기준으로만 추천한다. 사용자 이력을 누적해 장기 선호를 학습하거나, 동행인(혼자 / 커플 / 가족)에 따라 추천 전략을 분기하는 방향을 검토하고 있다.
-
----
-
-## 앱 화면
-
-| 단계 | 설명 |
-|------|------|
-| 성향 진단 | 6개 질문 응답 후 AI가 여행 성향 분류 |
-| 조건 입력 | 지역·날씨·예산·혼잡도·스타일 슬라이더 입력 |
-| 추천 결과 | 장소 카드 + 신뢰도 배지 + 성향 태그 표시 |
-| 일정 생성 | Day-by-Day 스트리밍 출력 |
-| 검증 결과 | 검증됨 / 미검증 분류 및 신뢰도 점수 표시 |
-| 다른 성향 추천 | 현재 조건 유지한 채 성향만 변경해 재추천 |
