@@ -15,6 +15,7 @@
 6. [프로젝트 진화 경로](#6-프로젝트-진화-경로)
 7. [기술 스택](#7-기술-스택)
 8. [실행 방법](#8-실행-방법)
+9. [배포](#9-배포)
 
 ---
 
@@ -313,3 +314,29 @@ python -X utf8 agents/multi_agent/test_final.py
 # Single Agent CLI
 python agents/single_agent/agent.py "노원 데이트 코스 추천해줘"
 ```
+
+---
+
+## 9. 배포
+
+### 컨테이너 구성
+
+`Dockerfile` + `docker-compose.yml`로 실행 환경을 표준화했다. Streamlit 앱과 FastAPI 인증 서버를 독립 컨테이너로 분리하고, `depends_on`으로 시작 순서를 보장한다.
+
+| 컨테이너 | 역할 | 포트 |
+|---------|------|------|
+| `travel-service` | Streamlit 앱 | 8501 |
+| `auth-service` | FastAPI 인증 서버 | 8000 |
+
+### 보안 설계
+
+API Key를 이미지 레이어에 포함하지 않기 위해 `docker-entrypoint.sh`를 사용했다. 컨테이너 시작 시 환경변수(`OPENAI_API_KEY`)로부터 `.streamlit/secrets.toml`을 동적으로 생성하고, `.dockerignore`로 실제 키 파일이 이미지에 복사되지 않도록 차단했다.
+
+### 클라우드 배포
+
+| 플랫폼 | 배포 방식 | 생성 URL |
+|--------|---------|---------|
+| Render | GitHub 연동 → Dockerfile 자동 감지 → 환경변수 설정 | `https://<name>.onrender.com` |
+| Railway | GitHub 연동 → Dockerfile 자동 감지 → Generate Domain | `https://<name>.up.railway.app` |
+
+공통 절차: GitHub 리포지토리 연결 → Docker 빌드 방식 선택 → `OPENAI_API_KEY` 환경변수 설정 → 배포.
