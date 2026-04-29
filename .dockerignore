@@ -1,0 +1,22 @@
+# 가상환경 (수백 MB — 이미지에서 pip install로 재설치)
+venv/
+
+# Git 히스토리
+.git/
+.gitignore
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*/__pycache__/
+
+# 민감 정보 — 절대 이미지에 포함 금지
+.env
+.streamlit/secrets.toml
+
+# 테스트/개발 전용 파일
+test_*.py
+test_output.txt
+validation_output.txt

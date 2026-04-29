@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  # ── Streamlit 앱 ──────────────────────────────────────────────────────────────
+  travel-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - AUTH_API_BASE=http://auth-service:8000
+    depends_on:
+      - auth-service
+    restart: unless-stopped
+
+  # ── FastAPI 인증 서버 ─────────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-changeme-replace-in-production}
+    restart: unless-stopped
