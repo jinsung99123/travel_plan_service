@@ -76,6 +76,9 @@ defaults = {
     "confidence_result": None,
     # ── 장소 교체 UX ─────────────────────────────────────────────────────────
     "_replace_flash": "",
+    # ── 코스 추천 ────────────────────────────────────────────────────────────
+    "course_result": None,   # {"courses": [...], "step_labels": [...]}
+    "course_query": "",      # 사용자가 입력한 코스 쿼리
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -827,10 +830,17 @@ def rewrite_query(
 
 
 # ── Query Optimization ───────────────────────────────────────────────────────
-# 복합 연결 패턴: "도 하고", "하고 싶어", "도 가고", "그리고" 등
+# 복합 연결 패턴: "도 하고", "하고 싶어", "도 가고", "그리고" + 코스/루트/플랜
 _COMPLEX_PATTERN = re.compile(
     r"도\s*하고|하고\s*싶|도\s*가고|도\s*먹고|그리고|뿐만\s*아니라|면서|며\s"
+    r"|코스|루트|플랜"
 )
+# 코스 추천 전용 키워드 패턴
+_COURSE_PATTERN = re.compile(r"코스|루트|플랜")
+
+def _is_course_query(query: str) -> bool:
+    """쿼리에 코스/루트/플랜 키워드가 포함되면 True."""
+    return bool(_COURSE_PATTERN.search(query))
 # 장소 카테고리 키워드 집합 (KEYWORD/MIXED 판별용)
 _PLACE_CATEGORIES = {
     "카페", "음식점", "맛집", "공원", "박물관", "갤러리", "시장",
@@ -1064,6 +1074,74 @@ def _fallback_decompose(query: str) -> list[str]:
     return found[:3] if found else [query]
 
 
+# ── 코스 단계별 쿼리 템플릿 ──────────────────────────────────────────────────
+_COURSE_STEP_TEMPLATES: dict[str, list[str]] = {
+    "데이트": [
+        "데이트하기 좋은 감성 카페 전시 문화공간",
+        "데이트 분위기 좋은 식당 맛집 점심 저녁",
+        "데이트 야경 루프탑 카페 마무리 산책",
+    ],
+    "가족": [
+        "가족과 함께 즐기는 체험 공원 놀이 문화",
+        "가족 식사하기 좋은 넓은 식당 맛집",
+        "가족 카페 디저트 휴식 공간",
+    ],
+    "친구": [
+        "친구들과 즐기기 좋은 체험 활동 볼링 스포츠",
+        "친구 식사 맛집 분위기 좋은 식당",
+        "친구 카페 놀기 좋은 감성 공간",
+    ],
+    "혼자": [
+        "혼자 조용히 쉬기 좋은 카페 독서 힐링",
+        "혼자 방문하기 좋은 식당 맛집 여유",
+        "혼자 산책 공원 자연 마무리",
+    ],
+    "힐링": [
+        "힐링하기 좋은 조용한 카페 자연 여유",
+        "가성비 좋은 맛집 식당 편안한",
+        "힐링 공원 산책 자연 마무리 여유",
+    ],
+    "_default": [
+        "오전 활동 체험 카페 산책 즐기기 좋은",
+        "점심 맛집 식사 식당 분위기 좋은",
+        "오후 카페 디저트 힐링 마무리 여유",
+    ],
+}
+
+_COURSE_MOOD_EXTRAS = {
+    "조용한": "조용한", "감성": "감성", "활기찬": "활기찬",
+    "여유": "여유로운", "저렴": "가성비", "고급": "고급스러운",
+}
+
+
+def _generate_course_subqueries(query: str, personality: str = "") -> list[str]:
+    """코스 쿼리에서 단계별 sub_queries 3개를 생성한다."""
+    purpose_map = {"데이트": "데이트", "가족": "가족", "친구": "친구", "혼자": "혼자", "힐링": "힐링"}
+    detected: str | None = None
+    for kw, key in purpose_map.items():
+        if kw in query:
+            detected = key
+            break
+
+    if detected is None and personality:
+        _persona_map = {
+            "감성형": "데이트", "미식형": "데이트",
+            "액티비티형": "친구", "탐방형": "친구",
+            "힐링형": "힐링", "균형형": "_default",
+        }
+        detected = _persona_map.get(personality)
+
+    templates = _COURSE_STEP_TEMPLATES.get(detected or "_default", _COURSE_STEP_TEMPLATES["_default"])
+
+    extra = ""
+    for kw, label in _COURSE_MOOD_EXTRAS.items():
+        if kw in query:
+            extra = f" {label}"
+            break
+
+    return [t + extra for t in templates]
+
+
 def decompose_query(query: str) -> dict:
     """
     복잡한 쿼리를 의미 보존형 하위 쿼리로 분해한다.
@@ -1205,6 +1283,49 @@ def multi_step_retrieve(
                 merged_pool.append(place)
 
     return {"main_places": merged_main, "candidate_pool": merged_pool}
+
+
+def multi_step_retrieve_course(
+    vectorstore,
+    sub_queries: list[str],
+    region: str,
+    personality: str = "",
+    weather: str = "",
+    budget: str = "",
+    crowd: str = "",
+    style: str = "",
+    llm=None,
+    top_k_per_step: int = 5,
+) -> list[list[dict]]:
+    """
+    코스 추천용 검색: sub_query별로 독립 검색 후 순서 유지 리스트로 반환.
+
+    반환: [[step1 top_k_per_step], [step2 top_k_per_step], [step3 top_k_per_step]]
+    """
+    course_candidates: list[list[dict]] = []
+    seen_ids: set[int] = set()
+
+    for i, sq in enumerate(sub_queries):
+        sq_keywords = _extract_sq_category(sq)
+        result = retrieve_places(
+            vectorstore, sq, region,
+            top_k=top_k_per_step * 3,
+            personality=personality,
+            weather=weather, budget=budget, crowd=crowd,
+            style=style, llm=llm,
+            keywords=sq_keywords,
+        )
+        candidates = result.get("main_places", [])
+
+        # 이전 단계에서 선택된 장소 제외 (중복 방지)
+        step_places = [p for p in candidates if p.get("id") not in seen_ids][:top_k_per_step]
+        for p in step_places:
+            seen_ids.add(p.get("id"))
+
+        course_candidates.append(step_places)
+        print(f"[course step {i+1}] '{sq}' → {len(step_places)}개 후보")
+
+    return course_candidates
 
 
 def generate_reason_summary(
@@ -1439,6 +1560,140 @@ def _replace_place(old_name: str) -> bool:
     return True
 
 
+def build_course(
+    course_candidates: list[list[dict]],
+    max_courses: int = 3,
+) -> list[list[dict]]:
+    """
+    단계별 후보에서 1개씩 선택하여 코스를 조합한다.
+
+    우선순위: 동일 카테고리 반복 없는 조합 → 없으면 중복 허용.
+    반환: [[step1 place, step2 place, step3 place], ...]  최대 max_courses개
+    """
+    import itertools
+
+    if not course_candidates or any(len(s) == 0 for s in course_candidates):
+        return []
+
+    courses: list[list[dict]] = []
+    seen_combos: set[tuple] = set()
+
+    # 각 단계 후보를 score 내림차순으로 정렬 (이미 retrieve 단계에서 정렬됨)
+    all_combos = list(itertools.product(*course_candidates))
+
+    def _has_cat_dup(combo: tuple) -> bool:
+        cats = [p.get("카테고리", "") for p in combo]
+        return len(cats) != len(set(cats))
+
+    # 1차: 카테고리 중복 없는 조합 우선
+    for combo in all_combos:
+        if len(courses) >= max_courses:
+            break
+        names = tuple(p.get("장소명", "") for p in combo)
+        if names in seen_combos or _has_cat_dup(combo):
+            continue
+        seen_combos.add(names)
+        courses.append(list(combo))
+
+    # 2차: 부족하면 카테고리 중복 허용하여 보충
+    if len(courses) < max_courses:
+        for combo in all_combos:
+            if len(courses) >= max_courses:
+                break
+            names = tuple(p.get("장소명", "") for p in combo)
+            if names not in seen_combos:
+                seen_combos.add(names)
+                courses.append(list(combo))
+
+    return courses
+
+
+def format_course_text(
+    courses: list[list[dict]],
+    step_labels: list[str],
+) -> str:
+    """코스 결과를 저장·TL;DR용 텍스트로 직렬화한다."""
+    lines: list[str] = []
+    for i, course in enumerate(courses, 1):
+        lines.append(f"[코스 {i}]")
+        for j, place in enumerate(course):
+            label = step_labels[j] if j < len(step_labels) else f"Step {j+1}"
+            name = place.get("장소명", "")
+            cat  = place.get("카테고리", "")
+            lines.append(f"  {j+1}. {label}: {name} ({cat})")
+        lines.append("")
+    return "\n".join(lines)
+
+
+_STEP_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+_COURSE_EMOJIS = ["🅐", "🅑", "🅒", "🅓", "🅔"]
+
+
+def render_course_output(
+    courses: list[list[dict]],
+    step_labels: list[str],
+) -> None:
+    """코스 추천 결과를 카드 UI로 렌더링한다."""
+    if not courses:
+        st.warning("코스를 구성할 장소가 부족합니다.")
+        return
+
+    for ci, course in enumerate(courses):
+        header_html = (
+            f"<div style='background:#4a7afe;color:white;border-radius:10px 10px 0 0;"
+            f"padding:10px 18px;font-size:16px;font-weight:700;margin-top:18px;'>"
+            f"코스 {ci+1} &nbsp;{'→'.join(p.get('장소명','') for p in course)}"
+            f"</div>"
+        )
+        st.markdown(header_html, unsafe_allow_html=True)
+
+        body_parts: list[str] = []
+        for j, place in enumerate(course):
+            label   = step_labels[j] if j < len(step_labels) else f"Step {j+1}"
+            emoji   = _STEP_EMOJIS[j] if j < len(_STEP_EMOJIS) else "📍"
+            name    = place.get("장소명", "")
+            cat     = place.get("카테고리", "")
+            crowd   = place.get("crowd_level", "")
+            indoor  = place.get("indoor_outdoor", "")
+            price   = place.get("price_level", "")
+
+            meta_items = [x for x in [crowd, indoor, price] if x]
+            meta_str   = " · ".join(meta_items) if meta_items else ""
+            meta_html  = (
+                f"<span style='font-size:11px;color:#888;margin-left:6px;'>{meta_str}</span>"
+                if meta_str else ""
+            )
+
+            connector = (
+                "<div style='margin:0 14px;color:#bbb;font-size:18px;align-self:center;'>→</div>"
+                if j < len(course) - 1 else ""
+            )
+
+            body_parts.append(
+                f"<div style='display:flex;flex-direction:column;align-items:center;"
+                f"flex:1;padding:12px 10px;'>"
+                f"  <div style='font-size:22px;'>{emoji}</div>"
+                f"  <div style='font-size:11px;color:#888;margin:3px 0;'>{label}</div>"
+                f"  <div style='font-size:14px;font-weight:700;color:#1a1a2e;text-align:center;'>"
+                f"    {name}"
+                f"  </div>"
+                f"  <div style='font-size:12px;color:#666;margin-top:2px;'>{cat}{meta_html}</div>"
+                f"</div>"
+                + connector
+            )
+
+        body_html = (
+            "<div style='display:flex;align-items:stretch;"
+            "background:#f8f9ff;border:1px solid #e0e6f0;"
+            "border-top:none;border-radius:0 0 10px 10px;padding:10px 16px;'>"
+            + "".join(body_parts)
+            + "</div>"
+        )
+        st.markdown(body_html, unsafe_allow_html=True)
+
+    st.divider()
+
+
 def generate_itinerary(
     personality: str,
     region: str,
@@ -1477,6 +1732,80 @@ def generate_itinerary(
     return full_text
 
 
+# ── 코스 추천 파이프라인 ──────────────────────────────────────────────────────
+def _run_course_pipeline(
+    vectorstore,
+    query: str,
+    personality: str,
+    region: str,
+    weather: str,
+    budget: str,
+    travel_style: float,
+    crowd: str,
+    style_label: str,
+    status_placeholder,
+    bar_placeholder,
+) -> None:
+    """코스 추천 전용 파이프라인: 단계별 검색 → 코스 조합 → 저장."""
+    import time
+
+    status_placeholder.info("🗺️ **코스 구성 중...** 단계별 장소를 검색하고 있습니다.")
+    bar_placeholder.progress(25)
+
+    sub_queries = _generate_course_subqueries(query, personality)
+    step_labels = ["1단계", "2단계", "3단계"][: len(sub_queries)]
+
+    llm = get_llm(streaming=False)
+    course_candidates = multi_step_retrieve_course(
+        vectorstore=vectorstore,
+        sub_queries=sub_queries,
+        region=region,
+        personality=personality,
+        weather=weather,
+        budget=budget,
+        crowd=crowd,
+        style=style_label,
+        llm=llm,
+        top_k_per_step=5,
+    )
+    bar_placeholder.progress(60)
+    status_placeholder.info("✨ **코스 조합 중...** 최적의 방문 순서를 결정하고 있습니다.")
+
+    courses = build_course(course_candidates, max_courses=3)
+    bar_placeholder.progress(80)
+
+    # 저장용 텍스트 + 세션 저장
+    course_text = format_course_text(courses, step_labels)
+    st.session_state.itinerary    = course_text
+    st.session_state.course_result = {
+        "courses":     courses,
+        "step_labels": step_labels,
+        "query":       query,
+    }
+
+    # 코스 전용 retrieved_places: 모든 단계 후보 flattened
+    all_places = [p for step in course_candidates for p in step]
+    st.session_state.retrieved_places = all_places
+    st.session_state.candidate_pool   = []
+
+    bar_placeholder.progress(90)
+    status_placeholder.info("📝 **TL;DR 요약 생성 중...**")
+    st.session_state["tldr_summary"] = generate_tldr_summary(
+        itinerary=course_text,
+        personality=personality,
+        travel_style=travel_style,
+    )
+    st.session_state.pop("validation", None)
+    st.session_state["reason_summary"]    = ""
+    st.session_state["confidence_result"] = None
+
+    bar_placeholder.progress(100)
+    status_placeholder.success("✅ 코스 추천 완료!")
+    time.sleep(0.8)
+    status_placeholder.empty()
+    bar_placeholder.empty()
+
+
 # ── 추천 파이프라인 ────────────────────────────────────────────────────────────
 def run_recommendation_pipeline(
     personality: str,
@@ -1486,6 +1815,7 @@ def run_recommendation_pipeline(
     budget: str,
     travel_style: float,
     crowd: str,
+    course_query: str = "",
 ) -> None:
     """RAG 검색 → 일정 생성 → 검증의 전체 파이프라인을 단계별 로딩 UX와 함께 실행한다."""
     import time
@@ -1501,12 +1831,31 @@ def run_recommendation_pipeline(
     vectorstore  = build_vectorstore(api_key)
     _bar.progress(20)
 
-    query = (
+    base_query = (
         f"{personality} "
         f"{get_personality_keywords(personality)} "
         f"{region}"
     )
+    # 코스 쿼리가 있으면 사용, 없으면 기본 성향+지역 쿼리 사용
+    query = course_query if course_query else base_query
     style_label = _style_label(travel_style)
+
+    # ── 코스 추천 모드 분기 ──────────────────────────────────────────────────
+    if _is_course_query(query):
+        _run_course_pipeline(
+            vectorstore=vectorstore,
+            query=query,
+            personality=personality,
+            region=region,
+            weather=weather,
+            budget=budget,
+            travel_style=travel_style,
+            crowd=crowd,
+            style_label=style_label,
+            status_placeholder=_status,
+            bar_placeholder=_bar,
+        )
+        return
 
     # ✅ Query Rewrite — retrieve_places 호출 직전
     _status.info("✏️ **쿼리 최적화 중...** 검색 성능 향상을 위해 쿼리를 재작성하고 있습니다.")
@@ -1854,6 +2203,14 @@ elif st.session_state.stage == 3:
                 ),
             )
 
+        st.markdown("**코스 추천 (선택사항)**")
+        course_input = st.text_input(
+            "코스 키워드 입력",
+            value=st.session_state.get("course_query", ""),
+            placeholder="예: 데이트 코스, 가족 루트, 친구 플랜",
+            help="입력 시 순서 있는 코스 형태로 추천합니다. 비워두면 일반 일정으로 생성됩니다.",
+        )
+
         submitted = st.form_submit_button("일정 생성하기", use_container_width=True)
 
     if submitted:
@@ -1869,6 +2226,9 @@ elif st.session_state.stage == 3:
             st.session_state.travel_style = travel_style
             st.session_state.budget = budget
             st.session_state.crowd = crowd
+            st.session_state.course_query  = course_input.strip()
+            st.session_state.course_result = None  # 새 추천 시 초기화
+            st.session_state.itinerary     = ""
             st.session_state.stage = 4
             st.rerun()
 
@@ -1962,6 +2322,7 @@ elif st.session_state.stage == 4:
             st.session_state["travel_style"]  = new_style
             st.session_state["crowd"]         = new_crowd
             st.session_state.itinerary        = ""
+            st.session_state.course_result    = None
 
             run_recommendation_pipeline(
                 personality=st.session_state.personality,
@@ -1971,6 +2332,7 @@ elif st.session_state.stage == 4:
                 budget=new_budget,
                 travel_style=new_style,
                 crowd=new_crowd,
+                course_query=st.session_state.get("course_query", ""),
             )
             st.rerun()
     # ─────────────────────────────────────────────────────────────────────────
@@ -1986,6 +2348,7 @@ elif st.session_state.stage == 4:
             budget=st.session_state.get("budget", "상관없음"),
             travel_style=float(st.session_state.get("travel_style", 0.5)),
             crowd=st.session_state.get("crowd", "상관없음"),
+            course_query=st.session_state.get("course_query", ""),
         )
         st.rerun()
     else:
@@ -2087,7 +2450,21 @@ elif st.session_state.stage == 4:
                 unsafe_allow_html=True,
             )
 
-        render_timeline(st.session_state.itinerary, interactive=True)
+        # ── 코스 추천 / 일반 일정 분기 렌더링 ────────────────────────────────
+        course_result = st.session_state.get("course_result")
+        if course_result and course_result.get("courses"):
+            st.markdown(
+                f"### 🗺️ 코스 추천 결과  "
+                f"<span style='font-size:13px;color:#888;font-weight:400;'>"
+                f"쿼리: {course_result.get('query', '')}</span>",
+                unsafe_allow_html=True,
+            )
+            render_course_output(
+                course_result["courses"],
+                course_result["step_labels"],
+            )
+        else:
+            render_timeline(st.session_state.itinerary, interactive=True)
 
         # ── 일정 저장 버튼 ───────────────────────────────────────────────────
         already_saved = any(
